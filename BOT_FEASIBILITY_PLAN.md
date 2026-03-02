@@ -114,7 +114,7 @@ Hybrid-mode снимает нагрузку с Render:
   - просмотр текущих параметров.
 
 ## 4.4 `/dev` (скрытая)
-- только для `DEV_TELEGRAM_IDS`;
+- только для `DEV_TELEGRAM_ID` и `DEV_TELEGRAM_ID_2`;
 - выдача premium по Telegram ID;
 - выбор срока кнопками;
 - запись в `subscriptions` + аудит в `audit_log`.
@@ -154,7 +154,7 @@ Hybrid-mode снимает нагрузку с Render:
 ## 7) Secrets / ENV
 Минимальный набор:
 - `BOT_TOKEN`
-- `DEV_TELEGRAM_IDS`
+- `DEV_TELEGRAM_ID` и `DEV_TELEGRAM_ID_2`
 - `BOT_USERNAME`
 - `TARIF_MESSAGE_1`
 - `TARIF_MESSAGE_3`

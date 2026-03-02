@@ -10,13 +10,13 @@
 ## 2) Что создать в Telegram
 1. Через @BotFather создать бота и получить `BOT_TOKEN`.
 2. Узнать `BOT_USERNAME` (без `@`).
-3. Узнать два Telegram ID разработчиков (для `/dev`) и записать в `DEV_TELEGRAM_IDS` через запятую (пример: `12345,67890`).
+3. Узнать два Telegram ID разработчиков (для `/dev`) и записать в `DEV_TELEGRAM_ID` и `DEV_TELEGRAM_ID_2` (по одному ID в каждую переменную).
 
 ## 3) Что создать в GitHub Secrets (Settings -> Secrets and variables -> Actions)
 Обязательные:
 - `BOT_TOKEN`
 - `BOT_USERNAME`
-- `DEV_TELEGRAM_IDS`
+- `DEV_TELEGRAM_ID` и `DEV_TELEGRAM_ID_2`
 - `TARIF_MESSAGE_1`
 - `TARIF_MESSAGE_3`
 - `TARIF_MESSAGE_6`
@@ -86,8 +86,8 @@ git push --force-with-lease
 ## 10) Если GitHub показывает конфликт именно в `.env.example`, `bot/config.py`, `bot/main.py`
 Используйте в этих файлах итоговый вариант из ветки `work`, где уже поддержаны два разработчика:
 
-- `.env.example`: переменная `DEV_TELEGRAM_IDS` (ID через запятую), плюс опциональный legacy-комментарий `DEV_TELEGRAM_ID`.
-- `bot/config.py`: чтение `DEV_TELEGRAM_IDS` с fallback на `DEV_TELEGRAM_ID`.
+- `.env.example`: переменная `DEV_TELEGRAM_ID` и `DEV_TELEGRAM_ID_2` (по одному ID в каждую переменную), плюс опциональный legacy-комментарий `DEV_TELEGRAM_IDS`.
+- `bot/config.py`: чтение `DEV_TELEGRAM_ID` и `DEV_TELEGRAM_ID_2` с optional fallback на `DEV_TELEGRAM_IDS`.
 - `bot/main.py`: проверка доступа к `/dev` через список `cfg.dev_telegram_ids`.
 
 Быстрые команды:
@@ -161,4 +161,4 @@ git commit
 git push
 ```
 
-> Важно про `ours/theirs`: в `rebase` и `merge` их смысл меняется. Если сомневаетесь — откройте файл и проверьте, что осталась логика `DEV_TELEGRAM_IDS` + fallback на `DEV_TELEGRAM_ID`.
+> Важно про `ours/theirs`: в `rebase` и `merge` их смысл меняется. Если сомневаетесь — откройте файл и проверьте, что осталась логика `DEV_TELEGRAM_ID` + `DEV_TELEGRAM_ID_2` (и optional fallback `DEV_TELEGRAM_IDS`).

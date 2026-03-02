@@ -20,27 +20,40 @@ class Config:
     db_path: str
 
 
-def _parse_dev_ids(raw_ids: str) -> tuple[int, ...]:
+def _to_int(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None
+
+
+def _build_dev_ids() -> tuple[int, ...]:
+    primary = _to_int(os.getenv("DEV_TELEGRAM_ID"))
+    secondary = _to_int(os.getenv("DEV_TELEGRAM_ID_2"))
+
     ids: list[int] = []
-    for item in raw_ids.split(","):
-        value = item.strip()
-        if not value:
-            continue
-        try:
-            ids.append(int(value))
-        except ValueError:
-            continue
+    if primary:
+        ids.append(primary)
+    if secondary and secondary not in ids:
+        ids.append(secondary)
+
+    # Backward compatibility for older comma-separated setup
+    fallback_csv = os.getenv("DEV_TELEGRAM_IDS", "")
+    for raw in fallback_csv.split(","):
+        parsed = _to_int(raw)
+        if parsed and parsed not in ids:
+            ids.append(parsed)
+
     return tuple(ids)
 
 
 def load_config() -> Config:
-    raw_dev_ids = os.getenv("DEV_TELEGRAM_IDS") or os.getenv("DEV_TELEGRAM_ID", "")
-    dev_ids = _parse_dev_ids(raw_dev_ids)
-
     return Config(
         bot_token=os.getenv("BOT_TOKEN", ""),
         bot_username=os.getenv("BOT_USERNAME", ""),
-        dev_telegram_ids=dev_ids,
+        dev_telegram_ids=_build_dev_ids(),
         support_url=os.getenv("SUPPORT_URL", "https://t.me/kiojomi"),
         tarif_message_1=os.getenv("TARIF_MESSAGE_1", "https://t.me/"),
         tarif_message_3=os.getenv("TARIF_MESSAGE_3", "https://t.me/"),
