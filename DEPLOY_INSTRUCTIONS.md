@@ -103,3 +103,62 @@ git add .env.example bot/config.py bot/main.py
 git rebase --continue
 git push --force-with-lease
 ```
+
+## 11) Пошагово: как снять конфликт в PR (CLI)
+
+Если в PR конфликтуют только эти файлы:
+- `.env.example`
+- `bot/config.py`
+- `bot/main.py`
+
+сделайте так:
+
+```bash
+# 1) Перейти в вашу рабочую ветку
+git checkout work
+
+# 2) Подтянуть актуальный main
+git fetch origin
+
+# 3) Начать rebase (или merge) на свежий main
+git rebase origin/main
+```
+
+Когда git остановится на конфликте:
+
+```bash
+# посмотреть конфликтные файлы
+git status
+
+# 4) для .env.example и bot/config.py обычно берём вашу (feature) версию
+# (в rebase: "--ours" = ветка main, "--theirs" = ваш коммит)
+git checkout --theirs .env.example bot/config.py
+
+# 5) bot/main.py открыть вручную и оставить финальную логику:
+# - is_dev(user_id) -> user_id in cfg.dev_telegram_ids
+# - проверка /dev только через список dev_telegram_ids
+
+# 6) отметить как решённые
+git add .env.example bot/config.py bot/main.py
+
+# 7) продолжить rebase
+git rebase --continue
+
+# 8) после завершения отправить ветку
+git push --force-with-lease
+```
+
+Если используете merge вместо rebase:
+```bash
+git merge origin/main
+# при конфликте:
+# "--ours" = ваша текущая ветка (work), "--theirs" = main
+git checkout --ours .env.example bot/config.py
+# bot/main.py правим вручную
+
+git add .env.example bot/config.py bot/main.py
+git commit
+git push
+```
+
+> Важно про `ours/theirs`: в `rebase` и `merge` их смысл меняется. Если сомневаетесь — откройте файл и проверьте, что осталась логика `DEV_TELEGRAM_IDS` + fallback на `DEV_TELEGRAM_ID`.
