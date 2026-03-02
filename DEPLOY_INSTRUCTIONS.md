@@ -82,3 +82,24 @@ git rebase origin/main
 git push --force-with-lease
 ```
 После этого снова откройте PR и выполните merge.
+
+## 10) Если GitHub показывает конфликт именно в `.env.example`, `bot/config.py`, `bot/main.py`
+Используйте в этих файлах итоговый вариант из ветки `work`, где уже поддержаны два разработчика:
+
+- `.env.example`: переменная `DEV_TELEGRAM_IDS` (ID через запятую), плюс опциональный legacy-комментарий `DEV_TELEGRAM_ID`.
+- `bot/config.py`: чтение `DEV_TELEGRAM_IDS` с fallback на `DEV_TELEGRAM_ID`.
+- `bot/main.py`: проверка доступа к `/dev` через список `cfg.dev_telegram_ids`.
+
+Быстрые команды:
+```bash
+git checkout work
+git fetch origin
+git rebase origin/main
+# если конфликт:
+# 1) открыть конфликтный файл
+# 2) оставить корректный финальный блок (как выше)
+# 3) затем:
+git add .env.example bot/config.py bot/main.py
+git rebase --continue
+git push --force-with-lease
+```

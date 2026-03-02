@@ -20,14 +20,22 @@ class Config:
     db_path: str
 
 
+def _parse_dev_ids(raw_ids: str) -> tuple[int, ...]:
+    ids: list[int] = []
+    for item in raw_ids.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            ids.append(int(value))
+        except ValueError:
+            continue
+    return tuple(ids)
+
 
 def load_config() -> Config:
-    raw_dev_ids = os.getenv("DEV_TELEGRAM_IDS") or os.getenv("DEV_TELEGRAM_ID", "0")
-    dev_ids = tuple(
-        int(item.strip())
-        for item in raw_dev_ids.split(",")
-        if item.strip().isdigit()
-    )
+    raw_dev_ids = os.getenv("DEV_TELEGRAM_IDS") or os.getenv("DEV_TELEGRAM_ID", "")
+    dev_ids = _parse_dev_ids(raw_dev_ids)
 
     return Config(
         bot_token=os.getenv("BOT_TOKEN", ""),
