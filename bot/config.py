@@ -6,7 +6,7 @@ import os
 class Config:
     bot_token: str
     bot_username: str
-    dev_telegram_id: int
+    dev_telegram_ids: tuple[int, ...]
     support_url: str
 
     tarif_message_1: str
@@ -20,12 +20,22 @@ class Config:
     db_path: str
 
 
+def _parse_dev_telegram_ids() -> tuple[int, ...]:
+    raw_ids = os.getenv("DEV_TELEGRAM_IDS", "").strip()
+    if raw_ids:
+        parsed = [item.strip() for item in raw_ids.split(",")]
+        return tuple(int(item) for item in parsed if item)
+
+    legacy_id = os.getenv("DEV_TELEGRAM_ID", "0").strip()
+    return (int(legacy_id),) if legacy_id and legacy_id != "0" else tuple()
+
+
 
 def load_config() -> Config:
     return Config(
         bot_token=os.getenv("BOT_TOKEN", ""),
         bot_username=os.getenv("BOT_USERNAME", ""),
-        dev_telegram_id=int(os.getenv("DEV_TELEGRAM_ID", "0")),
+        dev_telegram_ids=_parse_dev_telegram_ids(),
         support_url=os.getenv("SUPPORT_URL", "https://t.me/kiojomi"),
         tarif_message_1=os.getenv("TARIF_MESSAGE_1", "https://t.me/"),
         tarif_message_3=os.getenv("TARIF_MESSAGE_3", "https://t.me/"),
