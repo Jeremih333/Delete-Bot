@@ -1,21 +1,35 @@
 import asyncio
-import aiosqlite
-from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+
 from bot.config import load_config
+from bot.db import Database
 
 
 async def run_worker():
+    load_dotenv()
     cfg = load_config()
-    async with aiosqlite.connect(cfg.db_path) as db:
-        cur = await db.execute(
-            "SELECT id, chat_id, limit_count FROM scan_jobs WHERE status='pending' ORDER BY id LIMIT 20"
-        )
-        jobs = await cur.fetchall()
-        for job_id, chat_id, limit_count in jobs:
+    db = Database(
+        path=cfg.db_path,
+        backend=cfg.db_backend,
+        cloudflare_account_id=cfg.cloudflare_account_id,
+        cloudflare_d1_database_id=cfg.cloudflare_d1_database_id,
+        cloudflare_api_token=cfg.cloudflare_api_token,
+    )
+    await db.init()
+
+    jobs = await db.claim_pending_scan_jobs(limit=20)
+    failed = 0
+    for job_id, chat_id, limit_count in jobs:
+        try:
             # Здесь интегрируется реальная логика проверки/удаления участников.
-            await db.execute("UPDATE scan_jobs SET status='done', finished_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), job_id))
-        await db.commit()
-    print(f"Processed jobs: {len(jobs)}")
+            _ = (chat_id, limit_count)
+            await db.set_scan_job_status(job_id, "done", set_finished_at=True)
+        except Exception:
+            failed += 1
+            await db.set_scan_job_status(job_id, "failed", set_finished_at=True)
+
+    print(f"Processed jobs: {len(jobs)} | failed: {failed}")
 
 
 if __name__ == "__main__":

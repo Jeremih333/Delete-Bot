@@ -1,15 +1,16 @@
 import asyncio
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, Message
 from dotenv import load_dotenv
 
 from bot.config import load_config
 from bot.db import Database
-from bot.keyboards import start_kb, premium_kb, settings_kb, dev_kb
+from bot.keyboards import dev_kb, premium_kb, settings_kb, start_kb
 
 
 class DevGrant(StatesGroup):
@@ -19,9 +20,19 @@ class DevGrant(StatesGroup):
 
 load_dotenv()
 cfg = load_config()
-db = Database(cfg.db_path)
-
+db = Database(
+    path=cfg.db_path,
+    backend=cfg.db_backend,
+    cloudflare_account_id=cfg.cloudflare_account_id,
+    cloudflare_d1_database_id=cfg.cloudflare_d1_database_id,
+    cloudflare_api_token=cfg.cloudflare_api_token,
+)
 dp = Dispatcher(storage=MemoryStorage())
+
+
+async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    member = await bot.get_chat_member(chat_id, user_id)
+    return member.status in {"creator", "administrator"}
 
 
 @dp.message(Command("start"))
@@ -62,6 +73,9 @@ async def cmd_settings(m: Message):
     if m.chat.type == "private":
         await m.answer("⚙️ Откройте /settings в группе, где бот является админом.")
         return
+    if not await is_chat_admin(m.bot, m.chat.id, m.from_user.id):
+        await m.answer("⛔ Команда доступна только администраторам чата.")
+        return
     user_id = m.from_user.id
     premium = await db.is_premium(user_id)
     interval, frozen = await db.get_chat_settings(m.chat.id)
@@ -76,6 +90,13 @@ async def cmd_settings(m: Message):
 
 @dp.callback_query(F.data.startswith("set:"))
 async def cb_settings(c: CallbackQuery):
+    if not c.message:
+        await c.answer()
+        return
+    if not await is_chat_admin(c.bot, c.message.chat.id, c.from_user.id):
+        await c.answer("⛔ Только администратор может менять настройки", show_alert=True)
+        return
+
     user_id = c.from_user.id
     premium = await db.is_premium(user_id)
     _, kind, value = c.data.split(":")
@@ -111,6 +132,21 @@ async def cmd_dev(m: Message, state: FSMContext):
     await state.set_state(DevGrant.waiting_user_id)
 
 
+@dp.message(Command("dev_subscribers"))
+async def cmd_dev_subscribers(m: Message):
+    if m.from_user.id not in cfg.dev_telegram_ids:
+        await m.answer("⛔ Команда недоступна")
+        return
+    rows = await db.list_active_subscribers(limit=50)
+    if not rows:
+        await m.answer("Активных premium-подписчиков нет.")
+        return
+    lines = ["📋 <b>Активные premium-подписчики</b>"]
+    for user_id, expires_at, plan_months in rows:
+        lines.append(f"• <code>{user_id}</code> | {plan_months} мес. | до {expires_at}")
+    await m.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message(DevGrant.waiting_user_id)
 async def dev_user_id(m: Message, state: FSMContext):
     if m.from_user.id not in cfg.dev_telegram_ids:
@@ -136,7 +172,7 @@ async def dev_grant(c: CallbackQuery, state: FSMContext):
     if not uid:
         await c.answer("Сначала укажите ID через /dev", show_alert=True)
         return
-    await db.set_subscription(uid, months)
+    await db.set_subscription(uid, months, granted_by=c.from_user.id)
     await c.message.answer(f"✅ Premium выдан пользователю {uid} на {months} мес.")
     await c.answer("Готово")
     await state.clear()
@@ -144,12 +180,21 @@ async def dev_grant(c: CallbackQuery, state: FSMContext):
 
 @dp.message(Command("scan"))
 async def cmd_scan(m: Message):
+    if m.chat.type == "private":
+        await m.answer("⛔ Запустите /scan в группе, где бот является администратором.")
+        return
+    if not await is_chat_admin(m.bot, m.chat.id, m.from_user.id):
+        await m.answer("⛔ Команда доступна только администраторам чата.")
+        return
+
     premium = await db.is_premium(m.from_user.id)
     limit_count = 50000 if premium else 2000
     pending = await db.pending_jobs_count()
     await db.add_scan_job(m.chat.id, limit_count)
     mode = "HYBRID" if pending >= cfg.hybrid_queue_threshold else "LOCAL"
-    await m.answer(f"📊 Задача сканирования поставлена в очередь. Режим: {mode}. Лимит: {limit_count}")
+    await m.answer(
+        f"📊 Задача сканирования поставлена в очередь. Режим: {mode}. Лимит: {limit_count}"
+    )
 
 
 async def main():

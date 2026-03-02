@@ -17,17 +17,41 @@ class Config:
     hybrid_queue_threshold: int
     hybrid_scan_soft_timeout_ms: int
 
+    db_backend: str
     db_path: str
+    cloudflare_account_id: str
+    cloudflare_d1_database_id: str
+    cloudflare_api_token: str
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def _parse_dev_telegram_ids() -> tuple[int, ...]:
     raw_ids = os.getenv("DEV_TELEGRAM_IDS", "").strip()
     if raw_ids:
-        parsed = [item.strip() for item in raw_ids.split(",")]
-        return tuple(int(item) for item in parsed if item)
+        parsed: list[int] = []
+        for item in (chunk.strip() for chunk in raw_ids.split(",")):
+            if not item:
+                continue
+            try:
+                parsed.append(int(item))
+            except ValueError:
+                continue
+        return tuple(parsed)
 
     legacy_id = os.getenv("DEV_TELEGRAM_ID", "0").strip()
-    return (int(legacy_id),) if legacy_id and legacy_id != "0" else tuple()
+    if not legacy_id or legacy_id == "0":
+        return tuple()
+    try:
+        return (int(legacy_id),)
+    except ValueError:
+        return tuple()
 
 
 
@@ -41,7 +65,11 @@ def load_config() -> Config:
         tarif_message_3=os.getenv("TARIF_MESSAGE_3", "https://t.me/"),
         tarif_message_6=os.getenv("TARIF_MESSAGE_6", "https://t.me/"),
         tarif_message_12=os.getenv("TARIF_MESSAGE_12", "https://t.me/"),
-        hybrid_queue_threshold=int(os.getenv("HYBRID_QUEUE_THRESHOLD", "1000")),
-        hybrid_scan_soft_timeout_ms=int(os.getenv("HYBRID_SCAN_SOFT_TIMEOUT_MS", "30000")),
+        hybrid_queue_threshold=_parse_int_env("HYBRID_QUEUE_THRESHOLD", 1000),
+        hybrid_scan_soft_timeout_ms=_parse_int_env("HYBRID_SCAN_SOFT_TIMEOUT_MS", 30000),
+        db_backend=os.getenv("DB_BACKEND", "sqlite").strip().lower(),
         db_path=os.getenv("DB_PATH", "bot.db"),
+        cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip(),
+        cloudflare_d1_database_id=os.getenv("CLOUDFLARE_D1_DATABASE_ID", "").strip(),
+        cloudflare_api_token=os.getenv("CLOUDFLARE_API_TOKEN", "").strip(),
     )
