@@ -5,9 +5,14 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: bot-hybrid-worker
+  cancel-in-progress: false
+
 jobs:
   worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,9 +23,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run worker
         env:
-          DB_PATH: bot.db
+          DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
+          DB_PATH: ${{ secrets.DB_PATH || 'bot.db' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: python bot/worker_scan.py
