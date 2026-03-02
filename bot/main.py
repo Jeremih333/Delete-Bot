@@ -104,7 +104,7 @@ async def cb_settings(c: CallbackQuery):
 
 @dp.message(Command("dev"))
 async def cmd_dev(m: Message, state: FSMContext):
-    if m.from_user.id != cfg.dev_telegram_id:
+    if m.from_user.id not in cfg.dev_telegram_ids:
         await m.answer("⛔ Команда недоступна")
         return
     await m.answer("🧑‍💻 Введите Telegram ID пользователя для выдачи premium:")
@@ -113,7 +113,7 @@ async def cmd_dev(m: Message, state: FSMContext):
 
 @dp.message(DevGrant.waiting_user_id)
 async def dev_user_id(m: Message, state: FSMContext):
-    if m.from_user.id != cfg.dev_telegram_id:
+    if m.from_user.id not in cfg.dev_telegram_ids:
         return
     try:
         uid = int(m.text.strip())
@@ -127,7 +127,7 @@ async def dev_user_id(m: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("dev:grant:"))
 async def dev_grant(c: CallbackQuery, state: FSMContext):
-    if c.from_user.id != cfg.dev_telegram_id:
+    if c.from_user.id not in cfg.dev_telegram_ids:
         await c.answer("Недоступно", show_alert=True)
         return
     months = int(c.data.split(":")[-1])
