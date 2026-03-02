@@ -231,3 +231,7 @@ D1_API_TOKEN=<ваш_api_token>
 - `DB_BACKEND=d1`, но не задан один из `CF_ACCOUNT_ID / D1_DATABASE_ID / D1_API_TOKEN`.
 - Неправильные права API Token (нет D1 Edit).
 - Опечатка в `DB_BACKEND` (должно быть ровно `d1`).
+
+## 13) PR checks fail (conflicts / GitGuardian)
+Если PR показывает конфликты или GitGuardian secret alert, используйте чеклист из `CI_TROUBLESHOOTING.md`.
+
