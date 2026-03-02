@@ -25,7 +25,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 def is_dev(user_id: int) -> bool:
-    return user_id in cfg.dev_telegram_ids
+    return cfg.is_dev(user_id)
 
 
 @dp.message(Command("start"))
