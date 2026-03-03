@@ -10,7 +10,10 @@ from bot.moderation import classify_member, remove_member
 
 
 async def process_job(bot: Bot, db: Database, job_id: int, chat_id: int, limit_count: int, soft_timeout_ms: int):
-    _, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
+    chat_data = await db.get_managed_chat(chat_id)
+    owner_user_id = chat_data[3] if chat_data else 0
+    owner_premium = await db.is_premium(owner_user_id) if owner_user_id else False
+    _, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, owner_premium)
     candidate_ids = await db.get_tracked_members_for_scan(chat_id, limit_count)
     processed = 0
     removed_deleted = 0
@@ -40,8 +43,8 @@ async def process_job(bot: Bot, db: Database, job_id: int, chat_id: int, limit_c
     summary = (
         "✅ Авто-проверка завершена\n"
         f"Проверено: {processed}\n"
-        f"Удалено Deleted: {removed_deleted}\n"
-        f"Удалено Frozen: {removed_frozen}\n"
+        f"Удалено удаленных аккаунтов: {removed_deleted}\n"
+        f"Удалено замороженных аккаунтов: {removed_frozen}\n"
         f"Ошибок: {errors}"
     )
     try:

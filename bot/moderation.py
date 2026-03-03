@@ -17,11 +17,18 @@ def classify_member(
     delete_frozen_enabled: bool,
 ) -> str | None:
     user = member.user
+    status = getattr(member, "status", "")
+    if status in {"creator", "administrator"}:
+        return None
+    if bool(getattr(user, "is_bot", False)):
+        return None
+
     first_name = (user.first_name or "").strip().lower()
     if delete_deleted_enabled and first_name in DELETED_ACCOUNT_NAMES:
         return "deleted"
 
-    if delete_frozen_enabled and (bool(getattr(user, "is_fake", False)) or bool(getattr(user, "is_scam", False))):
+    is_frozen_signal = bool(getattr(user, "is_fake", False)) or bool(getattr(user, "is_scam", False))
+    if delete_frozen_enabled and is_frozen_signal:
         return "frozen"
 
     return None
@@ -42,3 +49,11 @@ async def remove_member(bot: Bot, chat_id: int, user_id: int, action: str) -> No
         await kick_member(bot, chat_id, user_id)
         return
     await ban_member(bot, chat_id, user_id)
+
+
+def reason_to_human(reason: str | None) -> str:
+    if reason == "deleted":
+        return "удаленный аккаунт"
+    if reason == "frozen":
+        return "замороженный аккаунт"
+    return "не определена"

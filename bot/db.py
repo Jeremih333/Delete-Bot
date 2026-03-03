@@ -21,6 +21,7 @@ TABLE_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS managed_chats (
       chat_id INTEGER PRIMARY KEY,
       title TEXT,
+      chat_type TEXT NOT NULL DEFAULT 'supergroup',
       owner_user_id INTEGER NOT NULL,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL,
@@ -82,6 +83,7 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE scan_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE chat_settings ADD COLUMN delete_deleted_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE chat_settings ADD COLUMN moderation_action TEXT NOT NULL DEFAULT 'ban'",
+    "ALTER TABLE managed_chats ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'supergroup'",
 ]
 
 
@@ -296,19 +298,21 @@ class Database:
         )
         return [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
 
-    async def upsert_managed_chat(self, chat_id: int, title: str, owner_user_id: int):
+    async def upsert_managed_chat(self, chat_id: int, title: str, owner_user_id: int, chat_type: str):
         now_iso = _iso_now()
+        type_norm = chat_type if chat_type in {"group", "supergroup", "channel"} else "supergroup"
         await self._backend.execute(
             """
-            INSERT INTO managed_chats(chat_id, title, owner_user_id, enabled, created_at, updated_at)
-            VALUES(?, ?, ?, 1, ?, ?)
+            INSERT INTO managed_chats(chat_id, title, chat_type, owner_user_id, enabled, created_at, updated_at)
+            VALUES(?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
               title=excluded.title,
+              chat_type=excluded.chat_type,
               owner_user_id=excluded.owner_user_id,
               enabled=1,
               updated_at=excluded.updated_at
             """,
-            (chat_id, title, owner_user_id, now_iso, now_iso),
+            (chat_id, title, type_norm, owner_user_id, now_iso, now_iso),
         )
         await self.ensure_chat_settings(chat_id)
         await self.grant_chat_admin(chat_id, owner_user_id, owner_user_id)
@@ -319,22 +323,52 @@ class Database:
             (_iso_now(), chat_id),
         )
 
-    async def list_owner_chats(self, owner_user_id: int) -> list[tuple[int, str, int]]:
+    async def list_owner_chats(self, owner_user_id: int) -> list[tuple[int, str, str, int]]:
         rows = await self._backend.fetchall(
             """
-            SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)), enabled
+            SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)), chat_type, enabled
             FROM managed_chats
             WHERE owner_user_id = ?
             ORDER BY updated_at DESC
             """,
             (owner_user_id,),
         )
-        return [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+        return [(int(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in rows]
 
-    async def get_managed_chat(self, chat_id: int) -> tuple[int, str, int, int] | None:
+    async def list_owner_chats_page(self, owner_user_id: int, offset: int, limit: int) -> list[tuple[int, str, str, int]]:
+        rows = await self._backend.fetchall(
+            """
+            SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)), chat_type, enabled
+            FROM managed_chats
+            WHERE owner_user_id = ?
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (owner_user_id, limit, offset),
+        )
+        return [(int(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in rows]
+
+    async def count_owner_chats(self, owner_user_id: int, chat_type: str | None = None) -> int:
+        if chat_type:
+            row = await self._backend.fetchone(
+                """
+                SELECT COUNT(*)
+                FROM managed_chats
+                WHERE owner_user_id = ? AND enabled = 1 AND chat_type = ?
+                """,
+                (owner_user_id, chat_type),
+            )
+            return int(row[0]) if row else 0
+        row = await self._backend.fetchone(
+            "SELECT COUNT(*) FROM managed_chats WHERE owner_user_id = ?",
+            (owner_user_id,),
+        )
+        return int(row[0]) if row else 0
+
+    async def get_managed_chat(self, chat_id: int) -> tuple[int, str, str, int, int] | None:
         row = await self._backend.fetchone(
             """
-            SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)), owner_user_id, enabled
+            SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)), chat_type, owner_user_id, enabled
             FROM managed_chats
             WHERE chat_id = ?
             """,
@@ -342,7 +376,7 @@ class Database:
         )
         if not row:
             return None
-        return (int(row[0]), str(row[1]), int(row[2]), int(row[3]))
+        return (int(row[0]), str(row[1]), str(row[2]), int(row[3]), int(row[4]))
 
     async def ensure_chat_settings(self, chat_id: int):
         await self._backend.execute("INSERT OR IGNORE INTO chat_settings(chat_id) VALUES(?)", (chat_id,))
@@ -398,6 +432,35 @@ class Database:
             "UPDATE chat_settings SET moderation_action = ? WHERE chat_id = ?",
             (action_norm, chat_id),
         )
+
+    async def enforce_plan_limits(self, chat_id: int, owner_is_premium: bool) -> tuple[int, int, int, str]:
+        interval, delete_deleted, delete_frozen, moderation_action = await self.get_chat_settings(chat_id)
+        if owner_is_premium:
+            return (interval, delete_deleted, delete_frozen, moderation_action)
+
+        changed = False
+        if interval != 14400:
+            interval = 14400
+            changed = True
+        if delete_frozen != 0:
+            delete_frozen = 0
+            changed = True
+        if moderation_action != "ban":
+            moderation_action = "ban"
+            changed = True
+
+        if changed:
+            await self._backend.execute(
+                """
+                UPDATE chat_settings
+                SET check_interval_seconds = ?,
+                    delete_frozen_enabled = 0,
+                    moderation_action = 'ban'
+                WHERE chat_id = ?
+                """,
+                (interval, chat_id),
+            )
+        return (interval, delete_deleted, delete_frozen, moderation_action)
 
     async def grant_chat_admin(self, chat_id: int, user_id: int, granted_by: int):
         await self._backend.execute(
@@ -540,6 +603,7 @@ class Database:
             FROM managed_chats mc
             JOIN chat_settings cs ON cs.chat_id = mc.chat_id
             WHERE mc.enabled = 1
+              AND mc.chat_type IN ('group', 'supergroup')
             LIMIT ?
             """,
             (limit,),
