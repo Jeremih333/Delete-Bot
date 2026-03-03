@@ -3,11 +3,19 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 def start_kb(bot_username: str):
     username = bot_username.strip().lstrip("@")
+    perms = "change_info+post_messages+edit_messages+delete_messages+invite_users+restrict_members+pin_messages+manage_topics+promote_members+manage_video_chats+anonymous"
+    group_url = (
+        f"https://t.me/{username}?startgroup=true&admin={perms}" if username else "https://t.me/"
+    )
+    channel_url = (
+        f"https://t.me/{username}?startchannel=true&admin={perms}" if username else "https://t.me/"
+    )
     b = InlineKeyboardBuilder()
     b.button(
-        text="➕ Добавить в группу",
-        url=f"https://t.me/{username}?startgroup=true" if username else "https://t.me/",
+        text="➕ Добавить в чат/группу",
+        url=group_url,
     )
+    b.button(text="📣 Добавить в канал", url=channel_url)
     b.button(text="⚙️ Открыть настройки", switch_inline_query_current_chat="/settings")
     b.adjust(1)
     return b.as_markup()

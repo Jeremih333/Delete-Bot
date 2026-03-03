@@ -40,7 +40,7 @@ TABLE_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS chat_settings (
       chat_id INTEGER PRIMARY KEY,
-      check_interval_seconds INTEGER NOT NULL DEFAULT 3600,
+      check_interval_seconds INTEGER NOT NULL DEFAULT 14400,
       delete_deleted_enabled INTEGER NOT NULL DEFAULT 1,
       delete_frozen_enabled INTEGER NOT NULL DEFAULT 0,
       moderation_action TEXT NOT NULL DEFAULT 'ban'
@@ -358,12 +358,15 @@ class Database:
             (chat_id,),
         )
         if not row:
-            return (3600, 1, 0, "ban")
+            return (14400, 1, 0, "ban")
         interval, delete_deleted, delete_frozen, action = row
         action_norm = str(action or "ban").lower()
         if action_norm not in {"ban", "kick"}:
             action_norm = "ban"
         return (int(interval), int(delete_deleted), int(delete_frozen), action_norm)
+
+    async def delete_subscription(self, user_id: int):
+        await self._backend.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
 
     async def set_interval(self, chat_id: int, seconds: int):
         await self.ensure_chat_settings(chat_id)

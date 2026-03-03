@@ -28,6 +28,7 @@ from bot.moderation import classify_member, remove_member
 class DevGrant(StatesGroup):
     waiting_user_id = State()
     waiting_months = State()
+    waiting_revoke_user_id = State()
 
 
 load_dotenv()
@@ -40,7 +41,26 @@ db = Database(
     cloudflare_api_token=cfg.cloudflare_api_token,
 )
 dp = Dispatcher(storage=MemoryStorage())
-BOT_REF: Bot | None = None
+
+
+def _md_escape(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+
+
+def _interval_label(seconds: int) -> str:
+    mapping = {
+        30: "30 секунд",
+        60: "1 минута",
+        3600: "1 час",
+        14400: "4 часа",
+    }
+    return mapping.get(seconds, f"{seconds} сек.")
 
 
 async def is_telegram_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
@@ -65,7 +85,7 @@ async def register_commands(bot: Bot):
         BotCommand(command="start", description="О боте и быстрый старт"),
         BotCommand(command="settings", description="Мои чаты и настройки"),
         BotCommand(command="premium", description="Тарифы Premium"),
-        BotCommand(command="status", description="Статус вашей подписки"),
+        BotCommand(command="status", description="Статус и преимущества"),
         BotCommand(command="help", description="Справка по командам"),
     ]
     group_commands = [
@@ -93,6 +113,7 @@ def _chat_settings_kb(
     delete_deleted: bool,
     delete_frozen: bool,
     moderation_action: str,
+    current_interval: int,
 ) -> InlineKeyboardMarkup:
     lock = "" if premium else "🔒 "
     b = InlineKeyboardBuilder()
@@ -106,13 +127,23 @@ def _chat_settings_kb(
     )
     action_label = "КИК" if moderation_action == "kick" else "БАН"
     action_lock = "" if premium or moderation_action == "ban" else "🔒 "
+    b.button(text=f"{action_lock}Режим удаления: {action_label}", callback_data=f"settings:toggle_action:{chat_id}")
     b.button(
-        text=f"{action_lock}Режим удаления: {action_label}",
-        callback_data=f"settings:toggle_action:{chat_id}",
+        text=f"{'✅ ' if current_interval == 14400 else ''}⏱ Интервал: 4 часа",
+        callback_data=f"settings:interval:{chat_id}:14400",
     )
-    b.button(text="⏱ Интервал: 1 час", callback_data=f"settings:interval:{chat_id}:3600")
-    b.button(text=f"{lock}⏱ Интервал: 1 мин", callback_data=f"settings:interval:{chat_id}:60")
-    b.button(text=f"{lock}⏱ Интервал: 30 сек", callback_data=f"settings:interval:{chat_id}:30")
+    b.button(
+        text=f"{lock}{'✅ ' if current_interval == 3600 else ''}⏱ Интервал: 1 час",
+        callback_data=f"settings:interval:{chat_id}:3600",
+    )
+    b.button(
+        text=f"{lock}{'✅ ' if current_interval == 60 else ''}⏱ Интервал: 1 минута",
+        callback_data=f"settings:interval:{chat_id}:60",
+    )
+    b.button(
+        text=f"{lock}{'✅ ' if current_interval == 30 else ''}⏱ Интервал: 30 секунд",
+        callback_data=f"settings:interval:{chat_id}:30",
+    )
     b.button(text="👮 Синхронизировать админов чата", callback_data=f"settings:sync_admins:{chat_id}")
     b.button(text="⬅️ К списку чатов", callback_data="settings:list")
     b.adjust(1)
@@ -121,19 +152,23 @@ def _chat_settings_kb(
 
 def _format_premium_text() -> str:
     return (
-        "💎 <b>Premium для полностью автоматической модерации</b>\n\n"
+        "💎 *Premium для автоматической модерации*\n\n"
         "Преимущества:\n"
-        "• ускоренные циклы проверки (1 минута / 30 секунд)\n"
-        "• удаление Frozen (Fake/Scam) аккаунтов\n"
+        "• интервалы 1 час / 1 минута / 30 секунд\n"
+        "• удаление Frozen (Fake/Scam)\n"
+        "• режим КИК (удаление без черного списка)\n"
         "• приоритет в очереди worker\n"
-        "• повышенный лимит проверки: 50 000 участников за цикл\n\n"
-        "Free-план: до <b>3 500</b> участников за цикл, удаление Deleted.\n\n"
-        "Тарифы:\n"
-        "• 1 месяц — <b>199₽</b>\n"
-        "• 3 месяца — <b>499₽</b> <s>599₽</s>\n"
-        "• 6 месяцев — <b>959₽</b> <s>1194₽</s>\n"
-        "• 12 месяцев — <b>1999₽</b> <s>2388₽</s>\n\n"
-        f"Поддержка: <a href='{cfg.support_url}'>связаться</a>"
+        "• повышенный лимит проверки\n\n"
+        "*Free-план:*\n"
+        "• интервал 4 часа\n"
+        "• удаление Deleted\n"
+        "• до 3 500 участников за цикл\n\n"
+        "*Тарифы:*\n"
+        "• 1 месяц — *199₽*\n"
+        "• 3 месяца — *499₽* ~599₽~\n"
+        "• 6 месяцев — *959₽* ~1194₽~\n"
+        "• 12 месяцев — *1999₽* ~2388₽~\n\n"
+        f"Поддержка: {cfg.support_url}"
     )
 
 
@@ -141,11 +176,12 @@ async def show_owner_chats(message: Message):
     chats = await db.list_owner_chats(message.from_user.id)
     if not chats:
         await message.answer(
-            "У вас пока нет чатов, подключенных к боту.\n\n"
-            "Добавьте бота в группу как администратора, затем откройте /settings снова.",
+            "📭 *Пока нет подключенных чатов*\n\n"
+            "Добавьте бота в чат/группу как администратора и откройте `/settings` снова.",
+            parse_mode="Markdown",
         )
         return
-    await message.answer("⚙️ <b>Ваши чаты</b>:", parse_mode="HTML", reply_markup=_settings_list_kb(chats))
+    await message.answer("⚙️ *Ваши чаты*:", parse_mode="Markdown", reply_markup=_settings_list_kb(chats))
 
 
 async def render_chat_settings_text(chat_id: int) -> str:
@@ -156,15 +192,16 @@ async def render_chat_settings_text(chat_id: int) -> str:
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     owner_premium = await db.is_premium(owner_user_id)
     admin_count = len(await db.list_chat_admins(chat_id))
+    safe_title = _md_escape(title)
     return (
-        f"⚙️ <b>{title}</b>\n\n"
-        f"Статус: <b>{'Активен' if enabled else 'Отключен'}</b>\n"
-        f"Интервал авто-проверки: <b>{interval} сек.</b>\n"
-        f"Удалять Deleted: <b>{'ON' if delete_deleted else 'OFF'}</b>\n"
-        f"Удалять Frozen(Fake/Scam): <b>{'ON' if delete_frozen else 'OFF'}</b>\n"
-        f"Режим удаления: <b>{'КИК (с авто-разбаном)' if moderation_action == 'kick' else 'БАН'}</b>\n"
-        f"План владельца: <b>{'Premium' if owner_premium else 'Free'}</b>\n"
-        f"Админов с доступом: <b>{admin_count}</b>"
+        f"⚙️ *{safe_title}*\n\n"
+        f"• Статус: *{'Активен' if enabled else 'Отключен'}*\n"
+        f"• Интервал авто-проверки: *{_interval_label(interval)}*\n"
+        f"• Удалять Deleted: *{'ON' if delete_deleted else 'OFF'}*\n"
+        f"• Удалять Frozen(Fake/Scam): *{'ON' if delete_frozen else 'OFF'}*\n"
+        f"• Режим удаления: *{'КИК (с авто-разбаном)' if moderation_action == 'kick' else 'БАН'}*\n"
+        f"• План владельца: *{'Premium' if owner_premium else 'Free'}*\n"
+        f"• Админов с доступом: *{admin_count}*"
     )
 
 
@@ -189,16 +226,16 @@ async def auto_enqueue_loop():
 @dp.message(Command("start"))
 async def cmd_start(m: Message, command: CommandObject):
     if m.chat.type != "private":
-        await m.answer("Откройте бота в личных сообщениях: /settings для управления чатами.")
+        await m.answer("Откройте бота в личных сообщениях: `/settings` для управления чатами.", parse_mode="Markdown")
         return
     text = (
-        "🛡️ <b>Delete Bot</b>\n\n"
-        "Бот работает автоматически в подключенных группах:\n"
-        "• удаляет <b>Deleted Account</b>\n"
-        "• удаляет <b>Frozen(Fake/Scam)</b> при включенной опции\n\n"
-        "Откройте <code>/settings</code>, чтобы управлять чатами."
+        "🛡️ *Delete Bot*\n\n"
+        "Бот работает автоматически в подключенных чатах и каналах:\n"
+        "• удаляет *Deleted Account*\n"
+        "• удаляет *Frozen(Fake/Scam)* при включенной опции\n\n"
+        "Откройте `/settings`, чтобы управлять чатами."
     )
-    await m.answer(text, parse_mode="HTML", reply_markup=start_kb(cfg.bot_username))
+    await m.answer(text, parse_mode="Markdown", reply_markup=start_kb(cfg.bot_username))
     if command.args == "settings":
         await show_owner_chats(m)
 
@@ -206,25 +243,25 @@ async def cmd_start(m: Message, command: CommandObject):
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
     text = (
-        "📚 <b>Справка</b>\n\n"
-        "ЛС:\n"
-        "• /settings — ваши чаты и параметры модерации\n"
-        "• /premium — тарифы\n"
-        "• /status — остаток подписки\n\n"
-        "Группа:\n"
-        "• /check — проверка пользователя (reply)\n"
-        "• /settings — ссылка в панель настроек\n"
-        "• /status — статус подписки владельца\n\n"
-        "Ручная команда /scan удалена: бот сканирует автоматически."
+        "📚 *Справка*\n\n"
+        "*ЛС:*\n"
+        "• `/settings` — ваши чаты и параметры модерации\n"
+        "• `/premium` — тарифы\n"
+        "• `/status` — статус и преимущества\n\n"
+        "*Группа:*\n"
+        "• `/check` — проверка пользователя (reply)\n"
+        "• `/settings` — ссылка в панель настроек\n"
+        "• `/status` — статус подписки владельца\n"
+        "• `/help` — краткая справка"
     )
-    await m.answer(text, parse_mode="HTML")
+    await m.answer(text, parse_mode="Markdown")
 
 
 @dp.message(Command("premium"))
 async def cmd_premium(m: Message):
     await m.answer(
         _format_premium_text(),
-        parse_mode="HTML",
+        parse_mode="Markdown",
         disable_web_page_preview=True,
         reply_markup=premium_kb(
             cfg.tarif_message_1,
@@ -252,11 +289,26 @@ async def cmd_status(m: Message):
     remaining_seconds = await db.premium_remaining_seconds(target_user_id)
     if premium:
         await m.answer(
-            f"✅ Premium активен. Осталось примерно: <b>{remaining_seconds // 86400} дн.</b>",
-            parse_mode="HTML",
+            "✅ *Premium активен*\n\n"
+            f"Осталось примерно: *{remaining_seconds // 86400} дн.*\n\n"
+            "Преимущества Premium:\n"
+            "• интервалы 1 час / 1 мин / 30 сек\n"
+            "• режим КИК (удаление без черного списка)\n"
+            "• удаление Frozen(Fake/Scam)\n"
+            "• приоритет задач в очереди\n"
+            "• увеличенный лимит проверки",
+            parse_mode="Markdown",
         )
     else:
-        await m.answer("ℹ️ Сейчас активен план <b>Free</b>.", parse_mode="HTML")
+        await m.answer(
+            "ℹ️ Сейчас активен план *Free*.\n\n"
+            "В Free доступно:\n"
+            "• интервал 4 часа\n"
+            "• удаление Deleted\n"
+            "• лимит 3 500 участников за цикл\n\n"
+            "Чтобы открыть расширенные функции, используйте /premium.",
+            parse_mode="Markdown",
+        )
 
 
 @dp.message(Command("settings"))
@@ -268,20 +320,17 @@ async def cmd_settings(m: Message):
         await m.answer("⛔ Команда доступна только назначенным администраторам.")
         return
     username = cfg.bot_username.strip().lstrip("@")
-    await m.answer(
-        "⚙️ Настройки этого чата управляются в ЛС.\n"
-        f"Откройте: https://t.me/{username}?start=settings"
-    )
+    await m.answer(f"⚙️ Настройки этого чата в ЛС:\nhttps://t.me/{username}?start=settings")
 
 
 @dp.callback_query(F.data == "settings:list")
 async def cb_settings_list(c: CallbackQuery):
     chats = await db.list_owner_chats(c.from_user.id)
     if not chats:
-        await c.message.edit_text("У вас нет управляемых чатов.")
+        await c.message.edit_text("📭 *У вас нет управляемых чатов.*", parse_mode="Markdown")
         await c.answer()
         return
-    await c.message.edit_text("⚙️ <b>Ваши чаты</b>:", parse_mode="HTML", reply_markup=_settings_list_kb(chats))
+    await c.message.edit_text("⚙️ *Ваши чаты*:", parse_mode="Markdown", reply_markup=_settings_list_kb(chats))
     await c.answer()
 
 
@@ -300,13 +349,14 @@ async def cb_settings_chat(c: CallbackQuery):
     text = await render_chat_settings_text(chat_id)
     await c.message.edit_text(
         text,
-        parse_mode="HTML",
+        parse_mode="Markdown",
         reply_markup=_chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
             moderation_action,
+            interval,
         ),
     )
     await c.answer()
@@ -326,13 +376,14 @@ async def cb_toggle_deleted(c: CallbackQuery):
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     await c.message.edit_text(
         text,
-        parse_mode="HTML",
+        parse_mode="Markdown",
         reply_markup=_chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
             moderation_action,
+            interval,
         ),
     )
     await c.answer("Обновлено")
@@ -355,13 +406,14 @@ async def cb_toggle_frozen(c: CallbackQuery):
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     await c.message.edit_text(
         text,
-        parse_mode="HTML",
+        parse_mode="Markdown",
         reply_markup=_chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
             moderation_action,
+            interval,
         ),
     )
     await c.answer("Обновлено")
@@ -385,13 +437,14 @@ async def cb_toggle_action(c: CallbackQuery):
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     await c.message.edit_text(
         text,
-        parse_mode="HTML",
+        parse_mode="Markdown",
         reply_markup=_chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
             moderation_action,
+            interval,
         ),
     )
     await c.answer("Режим удаления обновлен")
@@ -407,21 +460,22 @@ async def cb_interval(c: CallbackQuery):
         await c.answer("Недоступно", show_alert=True)
         return
     premium = await db.is_premium(c.from_user.id)
-    if seconds in (60, 30) and not premium:
-        await c.answer("Интервал 60/30 сек только для Premium", show_alert=True)
+    if seconds in (3600, 60, 30) and not premium:
+        await c.answer("🔒 Интервалы 1ч/1м/30с доступны только в Premium", show_alert=True)
         return
     await db.set_interval(chat_id, seconds)
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     await c.message.edit_text(
         text,
-        parse_mode="HTML",
+        parse_mode="Markdown",
         reply_markup=_chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
             moderation_action,
+            interval,
         ),
     )
     await c.answer("Интервал обновлен")
@@ -445,19 +499,21 @@ async def cb_sync_admins(c: CallbackQuery):
         uid = admin.user.id
         if uid not in existing:
             await db.grant_chat_admin(chat_id, uid, c.from_user.id)
+
     await c.answer("Админы синхронизированы")
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     premium = await db.is_premium(c.from_user.id)
     await c.message.edit_text(
         text,
-        parse_mode="HTML",
+        parse_mode="Markdown",
         reply_markup=_chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
             moderation_action,
+            interval,
         ),
     )
 
@@ -471,22 +527,40 @@ async def cmd_dev(m: Message, state: FSMContext, command: CommandObject):
         await m.answer("Команда /dev доступна только в личных сообщениях с ботом.")
         return
 
-    args = (command.args or "").strip().lower()
+    args_raw = (command.args or "").strip()
+    args = args_raw.lower()
     if args == "subscribers":
         rows = await db.list_active_subscribers(limit=50)
         if not rows:
             await m.answer("Активных Premium-подписчиков нет.")
             return
-        lines = ["📋 <b>Активные Premium-подписчики</b>"]
+        lines = ["📋 *Активные Premium-подписчики*"]
         for user_id, expires_at, plan_months in rows:
-            lines.append(f"• <code>{user_id}</code> | {plan_months} мес. | до {expires_at}")
-        await m.answer("\n".join(lines), parse_mode="HTML")
+            lines.append(f"• `{user_id}` | {plan_months} мес. | до {expires_at}")
+        await m.answer("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if args.startswith("revoke"):
+        parts = args_raw.split()
+        if len(parts) == 2:
+            try:
+                target = int(parts[1])
+                await db.delete_subscription(target)
+                await m.answer(f"✅ Premium снят у пользователя {target}.")
+                return
+            except ValueError:
+                await m.answer("Неверный формат. Используйте: /dev revoke <user_id>")
+                return
+        await m.answer("Отправьте Telegram ID пользователя для снятия Premium:")
+        await state.set_state(DevGrant.waiting_revoke_user_id)
         return
 
     await m.answer(
-        "🧑‍💻 Режим разработчика\n\n"
+        "🧑‍💻 *Режим разработчика*\n\n"
         "• /dev — выдать Premium пользователю\n"
-        "• /dev subscribers — список активных Premium"
+        "• /dev revoke — снять Premium\n"
+        "• /dev subscribers — список активных Premium",
+        parse_mode="Markdown",
     )
     await m.answer("Отправьте Telegram ID пользователя для выдачи Premium:")
     await state.set_state(DevGrant.waiting_user_id)
@@ -504,6 +578,20 @@ async def dev_user_id(m: Message, state: FSMContext):
     await state.update_data(target_user_id=uid)
     await state.set_state(DevGrant.waiting_months)
     await m.answer("Выберите срок подписки:", reply_markup=dev_kb())
+
+
+@dp.message(DevGrant.waiting_revoke_user_id)
+async def dev_revoke_user_id(m: Message, state: FSMContext):
+    if m.from_user.id not in cfg.dev_telegram_ids:
+        return
+    try:
+        uid = int((m.text or "").strip())
+    except ValueError:
+        await m.answer("Нужен числовой ID.")
+        return
+    await db.delete_subscription(uid)
+    await m.answer(f"✅ Premium снят у пользователя {uid}.")
+    await state.clear()
 
 
 @dp.callback_query(F.data.startswith("dev:grant:"))
@@ -534,6 +622,7 @@ async def cmd_check(m: Message):
     if not m.reply_to_message or not m.reply_to_message.from_user:
         await m.answer("Используйте /check ответом на сообщение пользователя.")
         return
+
     target_id = m.reply_to_message.from_user.id
     _, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(m.chat.id)
     member = await m.bot.get_chat_member(m.chat.id, target_id)
@@ -545,7 +634,7 @@ async def cmd_check(m: Message):
         return
     await remove_member(m.bot, m.chat.id, target_id, moderation_action)
     await db.set_member_check_result(m.chat.id, target_id, reason=reason, removed=True)
-    await m.answer(f"🚫 Пользователь удален. Причина: <b>{reason}</b>", parse_mode="HTML")
+    await m.answer(f"🚫 Пользователь удален. Причина: *{_md_escape(reason)}*", parse_mode="Markdown")
 
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
@@ -573,8 +662,8 @@ async def on_my_chat_member(update: ChatMemberUpdated):
         try:
             await update.bot.send_message(
                 update.from_user.id,
-                f"✅ Бот подключен к чату <b>{title}</b>.\nОткройте /settings для настройки.",
-                parse_mode="HTML",
+                f"✅ Бот подключен к чату *{_md_escape(title)}*.\nОткройте `/settings` для настройки.",
+                parse_mode="Markdown",
             )
         except Exception:
             pass
@@ -604,12 +693,10 @@ async def start_health_server() -> web.AppRunner | None:
 
 
 async def main():
-    global BOT_REF
     if not cfg.bot_token:
         raise RuntimeError("BOT_TOKEN is not set")
     await db.init()
     bot = Bot(cfg.bot_token)
-    BOT_REF = bot
     await register_commands(bot)
     runner = await start_health_server()
     scheduler_task = asyncio.create_task(auto_enqueue_loop())
