@@ -46,7 +46,7 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
     async def test_chat_settings_default_and_update(self):
         await self.db.ensure_chat_settings(-100123)
         interval, delete_deleted, delete_frozen, moderation_action = await self.db.get_chat_settings(chat_id=-100123)
-        self.assertEqual(interval, 3600)
+        self.assertEqual(interval, 14400)
         self.assertEqual(delete_deleted, 1)
         self.assertEqual(delete_frozen, 0)
         self.assertEqual(moderation_action, "ban")
