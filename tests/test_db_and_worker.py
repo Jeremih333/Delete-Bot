@@ -32,10 +32,15 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(datetime.fromisoformat(second[2]), datetime.fromisoformat(first[2]))
 
     async def test_managed_chat_and_admin_access(self):
-        await self.db.upsert_managed_chat(chat_id=-100123, title="Test Chat", owner_user_id=42)
+        await self.db.upsert_managed_chat(
+            chat_id=-100123,
+            title="Test Chat",
+            owner_user_id=42,
+            chat_type="supergroup",
+        )
         row = await self.db.get_managed_chat(-100123)
         self.assertIsNotNone(row)
-        self.assertEqual(row[2], 42)
+        self.assertEqual(row[3], 42)
         self.assertTrue(await self.db.has_chat_admin_access(-100123, 42))
 
         await self.db.grant_chat_admin(-100123, 99, 42)
@@ -61,6 +66,21 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frozen2, 1)
         self.assertEqual(action2, "kick")
 
+    async def test_enforce_plan_limits_downgrades_expired_premium_settings(self):
+        await self.db.ensure_chat_settings(-100888)
+        await self.db.set_interval(-100888, 30)
+        await self.db.set_frozen(-100888, True)
+        await self.db.set_moderation_action(-100888, "kick")
+
+        interval, delete_deleted, delete_frozen, action = await self.db.enforce_plan_limits(
+            chat_id=-100888,
+            owner_is_premium=False,
+        )
+        self.assertEqual(interval, 14400)
+        self.assertEqual(delete_deleted, 1)
+        self.assertEqual(delete_frozen, 0)
+        self.assertEqual(action, "ban")
+
     async def test_scan_jobs_priority_order(self):
         await self.db.add_scan_job(chat_id=-1, limit_count=10, priority=0)
         await self.db.add_scan_job(chat_id=-2, limit_count=10, priority=1)
@@ -69,12 +89,20 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claimed[1][1], -1)
 
     async def test_due_auto_enqueue(self):
-        await self.db.upsert_managed_chat(chat_id=-100001, title="A", owner_user_id=1)
+        await self.db.upsert_managed_chat(chat_id=-100001, title="A", owner_user_id=1, chat_type="supergroup")
         due = await self.db.list_chats_due_for_auto_enqueue(limit=10)
         self.assertIn(-100001, due)
         await self.db.touch_chat_auto_enqueue(-100001)
         due2 = await self.db.list_chats_due_for_auto_enqueue(limit=10)
         self.assertNotIn(-100001, due2)
+
+    async def test_owner_chat_counts_by_type(self):
+        await self.db.upsert_managed_chat(chat_id=-101, title="G1", owner_user_id=7, chat_type="group")
+        await self.db.upsert_managed_chat(chat_id=-102, title="SG1", owner_user_id=7, chat_type="supergroup")
+        await self.db.upsert_managed_chat(chat_id=-103, title="C1", owner_user_id=7, chat_type="channel")
+        self.assertEqual(await self.db.count_owner_chats(7, "group"), 1)
+        self.assertEqual(await self.db.count_owner_chats(7, "supergroup"), 1)
+        self.assertEqual(await self.db.count_owner_chats(7, "channel"), 1)
 
     async def test_track_members(self):
         await self.db.track_member(chat_id=-100001, user_id=10)
