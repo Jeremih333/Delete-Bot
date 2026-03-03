@@ -50,35 +50,43 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
 
     async def test_chat_settings_default_and_update(self):
         await self.db.ensure_chat_settings(-100123)
-        interval, delete_deleted, delete_frozen, moderation_action = await self.db.get_chat_settings(chat_id=-100123)
+        interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await self.db.get_chat_settings(chat_id=-100123)
         self.assertEqual(interval, 14400)
         self.assertEqual(delete_deleted, 1)
         self.assertEqual(delete_frozen, 0)
+        self.assertEqual(delete_inactive, 0)
+        self.assertEqual(inactive_days, 180)
         self.assertEqual(moderation_action, "ban")
 
         await self.db.set_interval(chat_id=-100123, seconds=60)
         await self.db.set_delete_deleted(chat_id=-100123, enabled=False)
         await self.db.set_frozen(chat_id=-100123, enabled=True)
         await self.db.set_moderation_action(chat_id=-100123, action="kick")
-        interval2, deleted2, frozen2, action2 = await self.db.get_chat_settings(chat_id=-100123)
+        interval2, deleted2, frozen2, inactive2, inactive_days2, action2 = await self.db.get_chat_settings(chat_id=-100123)
         self.assertEqual(interval2, 60)
         self.assertEqual(deleted2, 0)
         self.assertEqual(frozen2, 1)
+        self.assertEqual(inactive2, 0)
+        self.assertEqual(inactive_days2, 180)
         self.assertEqual(action2, "kick")
 
     async def test_enforce_plan_limits_downgrades_expired_premium_settings(self):
         await self.db.ensure_chat_settings(-100888)
         await self.db.set_interval(-100888, 30)
         await self.db.set_frozen(-100888, True)
+        await self.db.set_inactive_cleanup(-100888, True)
+        await self.db.set_inactive_days(-100888, 30)
         await self.db.set_moderation_action(-100888, "kick")
 
-        interval, delete_deleted, delete_frozen, action = await self.db.enforce_plan_limits(
+        interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, action = await self.db.enforce_plan_limits(
             chat_id=-100888,
             owner_is_premium=False,
         )
         self.assertEqual(interval, 14400)
         self.assertEqual(delete_deleted, 1)
         self.assertEqual(delete_frozen, 0)
+        self.assertEqual(delete_inactive, 0)
+        self.assertEqual(inactive_days, 180)
         self.assertEqual(action, "ban")
 
     async def test_scan_jobs_priority_order(self):
@@ -123,6 +131,13 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         members = await self.db.get_tracked_members_for_scan(chat_id=-100001, limit_count=10)
         self.assertEqual(set(members), {10, 11})
 
+    async def test_claim_scan_candidates_prefers_unchecked(self):
+        await self.db.track_member(chat_id=-100001, user_id=10)
+        await self.db.track_member(chat_id=-100001, user_id=11)
+        await self.db.set_member_check_result(chat_id=-100001, user_id=10, reason=None, removed=False)
+        candidates = await self.db.claim_scan_candidates(chat_id=-100001, limit_count=10)
+        self.assertIn(11, candidates)
+
     async def test_classify_member_rules(self):
         deleted_member = SimpleNamespace(user=SimpleNamespace(first_name="Deleted Account"))
         frozen_member = SimpleNamespace(user=SimpleNamespace(first_name="John", is_fake=True, is_scam=False))
@@ -143,7 +158,17 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         fake_bot = AsyncMock()
         fake_bot.get_chat_member.return_value = fake_member
 
-        processed, removed, errors, delete_task, report_total, timed_out = await process_job(
+        (
+            processed,
+            removed_deleted,
+            removed_frozen,
+            errors,
+            rate_limited_count,
+            delete_task,
+            report_tracked_total,
+            report_chat_total,
+            timed_out,
+        ) = await process_job(
             bot=fake_bot,
             db=self.db,
             job_id=job_id,
@@ -152,12 +177,38 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
             soft_timeout_ms=2000,
         )
         self.assertEqual(processed, 1)
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed_deleted + removed_frozen, 1)
         self.assertEqual(errors, 0)
-        self.assertGreaterEqual(report_total, 1)
+        self.assertGreaterEqual(report_tracked_total, 1)
+        self.assertGreaterEqual(report_chat_total, 1)
+        self.assertEqual(rate_limited_count, 0)
         self.assertFalse(timed_out)
         if delete_task:
             delete_task.cancel()
+
+    async def test_process_job_no_report_when_nothing_removed(self):
+        await self.db.ensure_chat_settings(-100777)
+        await self.db.track_member(chat_id=-100777, user_id=77)
+        await self.db.add_scan_job(chat_id=-100777, limit_count=10, priority=0)
+        claimed = await self.db.claim_pending_scan_jobs(limit=1)
+        job_id, chat_id, limit_count = claimed[0]
+
+        fake_member = SimpleNamespace(user=SimpleNamespace(first_name="Alice", is_fake=False, is_scam=False))
+        fake_bot = AsyncMock()
+        fake_bot.get_chat_member.return_value = fake_member
+        fake_bot.get_chat_member_count.return_value = 1
+        fake_bot.get_chat.return_value = SimpleNamespace(type="supergroup")
+
+        result = await process_job(
+            bot=fake_bot,
+            db=self.db,
+            job_id=job_id,
+            chat_id=chat_id,
+            limit_count=limit_count,
+            soft_timeout_ms=1000,
+        )
+        self.assertEqual(result[1] + result[2], 0)
+        self.assertEqual(fake_bot.send_message.await_count, 0)
 
     async def test_run_worker_processes_queue(self):
         await self.db.ensure_chat_settings(-100555)
