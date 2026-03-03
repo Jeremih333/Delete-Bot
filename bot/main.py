@@ -33,6 +33,7 @@ class DevGrant(StatesGroup):
 
 
 SETTINGS_PAGE_SIZE = 8
+ADMIN_ACCESS_PAGE_SIZE = 6
 
 load_dotenv()
 cfg = load_config()
@@ -99,27 +100,30 @@ def _readd_kb(chat_type: str) -> InlineKeyboardMarkup:
 async def _guard_owner_chat_access(c: CallbackQuery, chat_id: int) -> tuple[int, str, str, int, int] | None:
     chat_data = await db.get_managed_chat(chat_id)
     if not chat_data:
-        await c.answer("Чат не найден", show_alert=True)
-        return None
-    if c.from_user.id != chat_data[3]:
-        await c.answer("Доступ только владельцу чата", show_alert=True)
+        await c.answer("Chat not found", show_alert=True)
         return None
     if chat_data[4] == 0:
         chat_title = _md_escape(chat_data[1])
         chat_type = chat_data[2]
-        await c.answer("Бот удален из этого чата/канала", show_alert=True)
+        await c.answer("Bot was removed from this chat/channel", show_alert=True)
         await c.message.answer(
-            f"⚠️ Бот сейчас не подключён к *{chat_title}*.\n"
-            "Чтобы продолжить настройку, добавьте бота обратно.",
+            f"Bot is not connected to *{chat_title}*.\n"
+            "Add the bot back to continue setup.",
             parse_mode="Markdown",
             reply_markup=_readd_kb(chat_type),
         )
+        return None
+    if not await has_management_access(c.bot, chat_id, c.from_user.id):
+        await c.answer("Access denied: owner or synced admins only", show_alert=True)
         return None
     return chat_data
 
 
 async def is_telegram_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
-    member = await bot.get_chat_member(chat_id, user_id)
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
     return member.status in {"creator", "administrator"}
 
 
@@ -191,6 +195,7 @@ def _chat_settings_kb(
         callback_data=f"settings:interval:{chat_id}:30",
     )
     b.button(text="👮 Синхронизировать админов", callback_data=f"settings:sync_admins:{chat_id}")
+    b.button(text="👥 Настройка админов", callback_data=f"settings:admins:{chat_id}:1")
     b.button(text="⬅️ К списку", callback_data="settings:list:page:1")
     b.adjust(1)
     return b.as_markup()
@@ -239,6 +244,101 @@ async def _safe_edit_text(c: CallbackQuery, text: str, reply_markup: InlineKeybo
     except Exception:
         # If message is unchanged or cannot be edited, send a fresh message.
         await c.message.answer(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+
+def _admin_display_name(username: str | None, full_name: str | None, user_id: int) -> str:
+    if username:
+        return f"@{username}"
+    if full_name:
+        return full_name
+    return f"Пользователь {user_id}"
+
+
+def _trim_button_label(text: str, max_len: int = 56) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+async def _admin_access_payload(bot: Bot, chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    chat_data = await db.get_managed_chat(chat_id)
+    if not chat_data:
+        b = InlineKeyboardBuilder()
+        b.button(text="⬅️ К списку", callback_data="settings:list:page:1")
+        b.adjust(1)
+        return ("Чат не найден.", b.as_markup())
+
+    owner_user_id = chat_data[3]
+    access_set = set(await db.list_chat_admins(chat_id))
+
+    admins_live: list[tuple[int, str]] = []
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            if admin.user.is_bot:
+                continue
+            admins_live.append(
+                (
+                    admin.user.id,
+                    _admin_display_name(admin.user.username, admin.user.full_name, admin.user.id),
+                )
+            )
+    except Exception:
+        admins_live = []
+
+    # Fallback: if Telegram admin list is unavailable, show saved access list.
+    if not admins_live:
+        admins_live = [(uid, f"Пользователь {uid}") for uid in sorted(access_set)]
+        if owner_user_id not in access_set:
+            admins_live.insert(0, (owner_user_id, f"Владелец ({owner_user_id})"))
+
+    admins_live = sorted(admins_live, key=lambda x: x[1].lower())
+    total = len(admins_live)
+    pages = max(1, math.ceil(total / ADMIN_ACCESS_PAGE_SIZE))
+    page_norm = min(max(1, page), pages)
+    offset = (page_norm - 1) * ADMIN_ACCESS_PAGE_SIZE
+    page_admins = admins_live[offset : offset + ADMIN_ACCESS_PAGE_SIZE]
+
+    b = InlineKeyboardBuilder()
+    if not page_admins:
+        b.button(text="Администраторы не найдены", callback_data=f"settings:admins:{chat_id}:{page_norm}")
+    else:
+        for uid, display_name in page_admins:
+            has_access = uid in access_set
+            if uid == owner_user_id:
+                has_access = True
+            icon = "✅" if has_access else "❌"
+            label = _trim_button_label(f"{icon} {display_name}")
+            if uid == owner_user_id:
+                b.button(
+                    text=label,
+                    callback_data=f"settings:adminsnoop:{chat_id}:{uid}:{page_norm}",
+                )
+            else:
+                b.button(
+                    text=label,
+                    callback_data=f"settings:admin_toggle:{chat_id}:{uid}:{page_norm}",
+                )
+
+    if pages > 1:
+        b.button(text="<<", callback_data=f"settings:admins:{chat_id}:1")
+        b.button(text="<", callback_data=f"settings:admins:{chat_id}:{max(1, page_norm - 1)}")
+        b.button(text=f"{page_norm}/{pages}", callback_data=f"settings:admins:{chat_id}:{page_norm}")
+        b.button(text=">", callback_data=f"settings:admins:{chat_id}:{min(pages, page_norm + 1)}")
+        b.button(text=">>", callback_data=f"settings:admins:{chat_id}:{pages}")
+    b.button(text="⬅️ Назад к настройкам чата", callback_data=f"settings:chat:{chat_id}")
+    b.adjust(1)
+    if pages > 1:
+        b.adjust(1, 5, 1)
+
+    text = (
+        "👥 *Доступ администраторов к настройкам*\n\n"
+        f"Чат: `{chat_id}`\n"
+        "✅ доступ включен\n"
+        "❌ доступ выключен\n\n"
+        "Нажмите на пользователя, чтобы переключить доступ."
+    )
+    return text, b.as_markup()
 
 
 def _format_premium_text() -> str:
@@ -350,6 +450,33 @@ async def cmd_start(m: Message, command: CommandObject):
     await m.answer(text, parse_mode="Markdown", reply_markup=start_kb(cfg.bot_username))
     if command.args == "settings":
         await show_owner_chats(m)
+        return
+    if command.args and command.args.startswith("chat_"):
+        try:
+            chat_id = int(command.args.removeprefix("chat_"))
+        except ValueError:
+            return
+        chat_data = await db.get_managed_chat(chat_id)
+        if not chat_data:
+            await m.answer("Chat not found in bot settings.")
+            return
+        if not await has_management_access(m.bot, chat_id, m.from_user.id):
+            await m.answer("Access denied: this chat is available only to owner and synced admins.")
+            return
+        premium = await db.is_premium(chat_data[3])
+        interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+        await m.answer(
+            await render_chat_settings_text(chat_id),
+            parse_mode="Markdown",
+            reply_markup=_chat_settings_kb(
+                chat_id,
+                premium,
+                bool(delete_deleted),
+                bool(delete_frozen),
+                moderation_action,
+                interval,
+            ),
+        )
 
 
 @dp.message(Command("help"))
@@ -449,7 +576,7 @@ async def cmd_settings(m: Message):
         await m.answer("⛔ Команда доступна только назначенным администраторам.")
         return
     username = cfg.bot_username.strip().lstrip("@")
-    await m.answer(f"⚙️ Настройки этого чата в ЛС:\nhttps://t.me/{username}?start=settings")
+    await m.answer(f"⚙️ Настройки этого чата в ЛС:\nhttps://t.me/{username}?start=chat_{m.chat.id}")
 
 
 @dp.callback_query(F.data.startswith("settings:list:page:"))
@@ -466,7 +593,7 @@ async def cb_settings_chat(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    premium = await db.is_premium(c.from_user.id)
+    premium = await db.is_premium(chat_data[3])
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     text = await render_chat_settings_text(chat_id)
     await c.answer()
@@ -572,7 +699,7 @@ async def cb_toggle_action(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("settings:interval:"))
 async def cb_interval(c: CallbackQuery):
-    _, _, _, chat_raw, seconds_raw = c.data.split(":")
+    _, _, chat_raw, seconds_raw = c.data.split(":")
     chat_id = int(chat_raw)
     seconds = int(seconds_raw)
     chat_data = await _guard_owner_chat_access(c, chat_id)
@@ -637,6 +764,72 @@ async def cb_sync_admins(c: CallbackQuery):
             interval,
         ),
     )
+
+
+@dp.callback_query(F.data.startswith("settings:admins:"))
+async def cb_admins_page(c: CallbackQuery):
+    _, _, chat_raw, page_raw = c.data.split(":")
+    chat_id = int(chat_raw)
+    page = int(page_raw)
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
+        return
+    await c.answer()
+    text, kb = await _admin_access_payload(c.bot, chat_id, page)
+    await _safe_edit_text(c, text, kb)
+
+
+@dp.callback_query(F.data.startswith("settings:adminsnoop:"))
+async def cb_admins_noop(c: CallbackQuery):
+    await c.answer("Доступ владельца отключить нельзя.", show_alert=True)
+
+
+async def _toggle_admin_access(c: CallbackQuery, chat_id: int, target_user_id: int, page: int):
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
+        return
+
+    owner_user_id = chat_data[3]
+    if c.from_user.id != owner_user_id:
+        await c.answer("Только владелец чата может менять доступ админов.", show_alert=True)
+        return
+
+    if target_user_id == owner_user_id:
+        await c.answer("Доступ владельца отключить нельзя.", show_alert=True)
+        return
+
+    try:
+        admins = await c.bot.get_chat_administrators(chat_id)
+        live_admin_ids = {a.user.id for a in admins if not a.user.is_bot}
+    except Exception:
+        live_admin_ids = set()
+    if live_admin_ids and target_user_id not in live_admin_ids:
+        await c.answer("Пользователь больше не является администратором чата.", show_alert=True)
+        return
+
+    await c.answer()
+    has_access = await db.has_chat_admin_access(chat_id, target_user_id)
+    if has_access:
+        await db.revoke_chat_admin(chat_id, target_user_id)
+    else:
+        await db.grant_chat_admin(chat_id, target_user_id, owner_user_id)
+    text, kb = await _admin_access_payload(c.bot, chat_id, page)
+    await _safe_edit_text(c, text, kb)
+
+
+@dp.callback_query(F.data.startswith("settings:admin_toggle:"))
+async def cb_admin_toggle(c: CallbackQuery):
+    _, _, chat_raw, user_raw, page_raw = c.data.split(":")
+    await _toggle_admin_access(c, int(chat_raw), int(user_raw), int(page_raw))
+
+
+@dp.callback_query(F.data.startswith("settings:admin_revoke:"))
+async def cb_admin_revoke_legacy(c: CallbackQuery):
+    # Backward compatibility with old inline messages.
+    _, _, chat_raw, user_raw, page_raw = c.data.split(":")
+    await _toggle_admin_access(c, int(chat_raw), int(user_raw), int(page_raw))
+
+
 
 
 @dp.message(Command("dev"))
