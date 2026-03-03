@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from bot.config import load_config
 from bot.db import Database
 from bot.keyboards import dev_kb, premium_kb, start_kb
-from bot.moderation import classify_member, reason_to_human, remove_member
+from bot.moderation import classify_exception_as_reason, classify_member, reason_to_human, remove_member
 
 
 class DevGrant(StatesGroup):
@@ -100,21 +100,21 @@ def _readd_kb(chat_type: str) -> InlineKeyboardMarkup:
 async def _guard_owner_chat_access(c: CallbackQuery, chat_id: int) -> tuple[int, str, str, int, int] | None:
     chat_data = await db.get_managed_chat(chat_id)
     if not chat_data:
-        await c.answer("Chat not found", show_alert=True)
+        await c.answer("Чат не найден", show_alert=True)
         return None
     if chat_data[4] == 0:
         chat_title = _md_escape(chat_data[1])
         chat_type = chat_data[2]
-        await c.answer("Bot was removed from this chat/channel", show_alert=True)
+        await c.answer("Бот удален из этого чата/канала", show_alert=True)
         await c.message.answer(
-            f"Bot is not connected to *{chat_title}*.\n"
-            "Add the bot back to continue setup.",
+            f"Бот сейчас не подключен к *{chat_title}*.\n"
+            "Добавьте бота обратно, чтобы продолжить настройку.",
             parse_mode="Markdown",
             reply_markup=_readd_kb(chat_type),
         )
         return None
     if not await has_management_access(c.bot, chat_id, c.from_user.id):
-        await c.answer("Access denied: owner or synced admins only", show_alert=True)
+        await c.answer("Доступ только у владельца и синхронизированных админов", show_alert=True)
         return None
     return chat_data
 
@@ -201,39 +201,45 @@ def _chat_settings_kb(
     return b.as_markup()
 
 
-async def _settings_page_payload(owner_user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
-    owner_premium = await db.is_premium(owner_user_id)
+async def _settings_page_payload(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    owner_premium = await db.is_premium(user_id)
     chat_limit, channel_limit = _plan_limits(owner_premium)
-    active_chats = (await db.count_owner_chats(owner_user_id, "group")) + (
-        await db.count_owner_chats(owner_user_id, "supergroup")
+    active_chats = (await db.count_owner_chats(user_id, "group")) + (
+        await db.count_owner_chats(user_id, "supergroup")
     )
-    active_channels = await db.count_owner_chats(owner_user_id, "channel")
-    total = await db.count_owner_chats(owner_user_id)
+    active_channels = await db.count_owner_chats(user_id, "channel")
+    total = await db.count_accessible_chats(user_id)
+    trusted_total = max(0, total - await db.count_owner_chats(user_id))
     pages = max(1, math.ceil(total / SETTINGS_PAGE_SIZE))
     page_norm = min(max(1, page), pages)
     offset = (page_norm - 1) * SETTINGS_PAGE_SIZE
-    rows = await db.list_owner_chats_page(owner_user_id, offset=offset, limit=SETTINGS_PAGE_SIZE)
+    rows = await db.list_accessible_chats_page(user_id, offset=offset, limit=SETTINGS_PAGE_SIZE)
 
     b = InlineKeyboardBuilder()
-    for chat_id, title, chat_type, enabled in rows:
-        icon = "📣" if chat_type == "channel" else "👥"
-        state = "🟢" if enabled else "⚫"
-        b.button(text=f"{state} {icon} {title}", callback_data=f"settings:chat:{chat_id}")
+    for chat_id, title, chat_type, enabled, owner_user_id in rows:
+        icon = "КАНАЛ" if chat_type == "channel" else "ЧАТ"
+        state = "ВКЛ" if enabled else "ВЫКЛ"
+        role = "ВЛАДЕЛЕЦ" if owner_user_id == user_id else "ДОВЕРЕННЫЙ"
+        b.button(text=f"[{state}] [{role}] [{icon}] {title}", callback_data=f"settings:chat:{chat_id}")
     if pages > 1:
-        b.button(text="⏮", callback_data="settings:list:page:1")
-        b.button(text="◀️", callback_data=f"settings:list:page:{max(1, page_norm - 1)}")
+        b.button(text="<<", callback_data="settings:list:page:1")
+        b.button(text="<", callback_data=f"settings:list:page:{max(1, page_norm - 1)}")
         b.button(text=f"{page_norm}/{pages}", callback_data=f"settings:list:page:{page_norm}")
-        b.button(text="▶️", callback_data=f"settings:list:page:{min(pages, page_norm + 1)}")
-        b.button(text="⏭", callback_data=f"settings:list:page:{pages}")
+        b.button(text=">", callback_data=f"settings:list:page:{min(pages, page_norm + 1)}")
+        b.button(text=">>", callback_data=f"settings:list:page:{pages}")
     b.adjust(1)
     if pages > 1:
         b.adjust(1, 5)
 
-    text = (
-        "⚙️ *Ваши чаты и каналы*\n\n"
-        f"Подключено чатов: *{active_chats}/{chat_limit}*\n"
-        f"Подключено каналов: *{active_channels}/{channel_limit}*\n"
-        f"Страница: *{page_norm}/{pages}*"
+    text = "\n".join(
+        [
+            "*Ваши чаты и каналы*",
+            "",
+            f"Ваши чаты: *{active_chats}/{chat_limit}*",
+            f"Ваши каналы: *{active_channels}/{channel_limit}*",
+            f"Доверенные чаты: *{trusted_total}*",
+            f"Страница: *{page_norm}/{pages}*",
+        ]
     )
     return text, b.as_markup()
 
@@ -366,7 +372,7 @@ def _format_premium_text() -> str:
 
 
 async def show_owner_chats(message: Message, page: int = 1):
-    total = await db.count_owner_chats(message.from_user.id)
+    total = await db.count_accessible_chats(message.from_user.id)
     if total == 0:
         await message.answer(
             "📭 *Пока нет подключенных чатов*\n\n"
@@ -395,10 +401,10 @@ async def render_chat_settings_text(chat_id: int) -> str:
         f"⚙️ *{safe_title}* ({_chat_kind(chat_type)})\n\n"
         f"• Статус: *{'Активен' if enabled else 'Отключен'}*\n"
         f"• Интервал авто-проверки: *{_interval_label(interval)}*\n"
-        f"• Удалять удаленные аккаунты: *{'ON' if delete_deleted else 'OFF'}*\n"
-        f"• Удалять замороженные аккаунты: *{'ON' if delete_frozen else 'OFF'}*\n"
+        f"• Удалять удаленные аккаунты: *{'ВКЛ' if delete_deleted else 'ВЫКЛ'}*\n"
+        f"• Удалять замороженные аккаунты: *{'ВКЛ' if delete_frozen else 'ВЫКЛ'}*\n"
         f"• Режим удаления: *{'КИК (с авто-разбаном)' if moderation_action == 'kick' else 'БАН'}*\n"
-        f"• План владельца: *{'Premium' if owner_premium else 'Free'}*\n"
+        f"• План владельца: *{'Премиум' if owner_premium else 'Бесплатный'}*\n"
         f"• Админов с доступом: *{admin_count}*"
     )
     if chat_type == "channel":
@@ -420,8 +426,12 @@ async def auto_enqueue_loop():
                 owner_user_id = chat_data[3]
                 premium = await db.is_premium(owner_user_id)
                 await db.enforce_plan_limits(chat_id, premium)
-                limit_count = 50000 if premium else 3500
-                await db.add_scan_job(chat_id, limit_count, priority=1 if premium else 0)
+                if premium:
+                    limit_count = await db.count_tracked_members(chat_id)
+                else:
+                    limit_count = 3500
+                if limit_count > 0:
+                    await db.add_scan_job(chat_id, limit_count, priority=1 if premium else 0)
                 await db.touch_chat_auto_enqueue(chat_id)
         except Exception:
             pass
@@ -458,10 +468,10 @@ async def cmd_start(m: Message, command: CommandObject):
             return
         chat_data = await db.get_managed_chat(chat_id)
         if not chat_data:
-            await m.answer("Chat not found in bot settings.")
+            await m.answer("Чат не найден в настройках бота.")
             return
         if not await has_management_access(m.bot, chat_id, m.from_user.id):
-            await m.answer("Access denied: this chat is available only to owner and synced admins.")
+            await m.answer("Доступ запрещен: этот чат доступен только владельцу и синхронизированным админам.")
             return
         premium = await db.is_premium(chat_data[3])
         interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
@@ -562,6 +572,15 @@ async def cmd_status(m: Message):
             "Чтобы открыть расширенные функции, используйте /premium.",
             parse_mode="Markdown",
         )
+
+
+    await m.answer(
+        "ℹ️ *Как определяется статус аккаунтов*\n\n"
+        "• *Удаленный аккаунт*: имя профиля совпадает с шаблоном удаленного аккаунта или Telegram возвращает признак деактивации при проверке.\n"
+        "• *Замороженный аккаунт*: используются сигналы подозрительного профиля (fake/scam), если они доступны для данного пользователя.\n"
+        "• Проверка выполняется только по участникам, которых бот уже видел в чате (ограничение Bot API).",
+        parse_mode="Markdown",
+    )
 
 
 @dp.message(Command("settings"))
@@ -945,8 +964,11 @@ async def cmd_check(m: Message):
     owner_user_id = chat_data[3] if chat_data else m.from_user.id
     owner_premium = await db.is_premium(owner_user_id)
     _, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(m.chat.id, owner_premium)
-    member = await m.bot.get_chat_member(m.chat.id, target_id)
-    reason = classify_member(member, bool(delete_deleted), bool(delete_frozen))
+    try:
+        member = await m.bot.get_chat_member(m.chat.id, target_id)
+        reason = classify_member(member, bool(delete_deleted), bool(delete_frozen))
+    except Exception as exc:
+        reason = classify_exception_as_reason(exc, bool(delete_deleted))
     await db.track_member(m.chat.id, target_id)
     await db.set_member_check_result(m.chat.id, target_id, reason=reason, removed=False)
     if not reason:

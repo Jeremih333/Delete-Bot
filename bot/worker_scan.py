@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 from time import monotonic
 
 from aiogram import Bot
@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from bot.config import load_config
 from bot.db import Database
-from bot.moderation import classify_member, remove_member
+from bot.moderation import classify_exception_as_reason, classify_member, remove_member
 
 
 def _interval_label(seconds: int) -> str:
@@ -32,39 +32,52 @@ async def process_job(bot: Bot, db: Database, job_id: int, chat_id: int, limit_c
     owner_user_id = chat_data[3] if chat_data else 0
     owner_premium = await db.is_premium(owner_user_id) if owner_user_id else False
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, owner_premium)
-    candidate_ids = await db.get_tracked_members_for_scan(chat_id, limit_count)
+
     processed = 0
     removed_deleted = 0
     removed_frozen = 0
     errors = 0
 
+    chunk_size = 1000
+    offset = 0
     deadline = monotonic() + (soft_timeout_ms / 1000.0)
-    for user_id in candidate_ids:
-        if monotonic() >= deadline:
+
+    while processed < limit_count and monotonic() < deadline:
+        batch_limit = min(chunk_size, limit_count - processed)
+        candidate_ids = await db.get_tracked_members_for_scan(chat_id, batch_limit, offset=offset)
+        if not candidate_ids:
             break
-        try:
-            member = await bot.get_chat_member(chat_id, user_id)
-            reason = classify_member(member, bool(delete_deleted), bool(delete_frozen))
-            await db.set_member_check_result(chat_id, user_id, reason=reason, removed=False)
-            if reason:
-                await remove_member(bot, chat_id, user_id, moderation_action)
-                await db.set_member_check_result(chat_id, user_id, reason=reason, removed=True)
-                if reason == "deleted":
-                    removed_deleted += 1
-                elif reason == "frozen":
-                    removed_frozen += 1
-            processed += 1
-        except Exception:
-            errors += 1
-        await asyncio.sleep(0.03)
+
+        for user_id in candidate_ids:
+            if monotonic() >= deadline:
+                break
+            try:
+                member = await bot.get_chat_member(chat_id, user_id)
+                reason = classify_member(member, bool(delete_deleted), bool(delete_frozen))
+                await db.set_member_check_result(chat_id, user_id, reason=reason, removed=False)
+                if reason:
+                    await remove_member(bot, chat_id, user_id, moderation_action)
+                    await db.set_member_check_result(chat_id, user_id, reason=reason, removed=True)
+                    if reason == "deleted":
+                        removed_deleted += 1
+                    elif reason == "frozen":
+                        removed_frozen += 1
+                processed += 1
+            except Exception as exc:
+                reason = classify_exception_as_reason(exc, bool(delete_deleted))
+                if reason:
+                    await db.set_member_check_result(chat_id, user_id, reason=reason, removed=False)
+                errors += 1
+            await asyncio.sleep(0.03)
+
+        offset += len(candidate_ids)
 
     summary = (
         "✅ *Авто-проверка завершена*\n\n"
         f"⚙️ Интервал: *{_interval_label(interval)}*\n"
-        f"🛡️ Режим удаления: *{'КИК' if moderation_action == 'kick' else 'БАН'}*\n"
-        f"🧩 Правила: удаленные *{'ON' if delete_deleted else 'OFF'}*, "
-        f"замороженные *{'ON' if delete_frozen else 'OFF'}*\n\n"
-        f"👥 Проверено: *{processed}*\n"
+        f"🛡️ Режим: *{'КИК' if moderation_action == 'kick' else 'БАН'}*\n"
+        f"🧩 Правила: удаленные *{'ВКЛ' if delete_deleted else 'ВЫКЛ'}*, замороженные *{'ВКЛ' if delete_frozen else 'ВЫКЛ'}*\n\n"
+        f"👥 Проверено: *{processed}/{limit_count}*\n"
         f"🗑️ Удалено удаленных аккаунтов: *{removed_deleted}*\n"
         f"🧊 Удалено замороженных аккаунтов: *{removed_frozen}*\n"
         f"⚠️ Ошибок: *{errors}*\n\n"
@@ -74,14 +87,14 @@ async def process_job(bot: Bot, db: Database, job_id: int, chat_id: int, limit_c
         summary = (
             "✅ *Авто-проверка завершена*\n\n"
             f"⚙️ Интервал: *{_interval_label(interval)}*\n"
-            f"🛡️ Режим удаления: *{'КИК' if moderation_action == 'kick' else 'БАН'}*\n"
-            f"🧩 Правила: удаленные *{'ON' if delete_deleted else 'OFF'}*, "
-            f"замороженные *{'ON' if delete_frozen else 'OFF'}*\n\n"
-            f"👥 Проверено: *{processed}*\n"
-            "✨ Ничего подозрительного не найдено.\n"
+            f"🛡️ Режим: *{'КИК' if moderation_action == 'kick' else 'БАН'}*\n"
+            f"🧩 Правила: удаленные *{'ВКЛ' if delete_deleted else 'ВЫКЛ'}*, замороженные *{'ВКЛ' if delete_frozen else 'ВЫКЛ'}*\n\n"
+            f"👥 Проверено: *{processed}/{limit_count}*\n"
+            "✨ Подозрительных аккаунтов не найдено.\n"
             f"⚠️ Ошибок: *{errors}*\n\n"
             "_Это сообщение удалится через 30 секунд._"
         )
+
     delete_task = None
     try:
         chat = await bot.get_chat(chat_id)

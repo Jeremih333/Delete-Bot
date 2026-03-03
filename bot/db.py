@@ -348,6 +348,51 @@ class Database:
         )
         return [(int(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in rows]
 
+    async def list_accessible_chats_page(
+        self,
+        user_id: int,
+        offset: int,
+        limit: int,
+    ) -> list[tuple[int, str, str, int, int]]:
+        rows = await self._backend.fetchall(
+            """
+            SELECT mc.chat_id,
+                   COALESCE(mc.title, CAST(mc.chat_id AS TEXT)),
+                   mc.chat_type,
+                   mc.enabled,
+                   mc.owner_user_id
+            FROM managed_chats mc
+            WHERE mc.owner_user_id = ?
+               OR EXISTS (
+                    SELECT 1
+                    FROM chat_admin_access ca
+                    WHERE ca.chat_id = mc.chat_id
+                      AND ca.user_id = ?
+               )
+            ORDER BY mc.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, user_id, limit, offset),
+        )
+        return [(int(r[0]), str(r[1]), str(r[2]), int(r[3]), int(r[4])) for r in rows]
+
+    async def count_accessible_chats(self, user_id: int) -> int:
+        row = await self._backend.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM managed_chats mc
+            WHERE mc.owner_user_id = ?
+               OR EXISTS (
+                    SELECT 1
+                    FROM chat_admin_access ca
+                    WHERE ca.chat_id = mc.chat_id
+                      AND ca.user_id = ?
+               )
+            """,
+            (user_id, user_id),
+        )
+        return int(row[0]) if row else 0
+
     async def count_owner_chats(self, owner_user_id: int, chat_type: str | None = None) -> int:
         if chat_type:
             row = await self._backend.fetchone(
@@ -504,18 +549,25 @@ class Database:
             (chat_id, user_id, now_iso, now_iso),
         )
 
-    async def get_tracked_members_for_scan(self, chat_id: int, limit_count: int) -> list[int]:
+    async def get_tracked_members_for_scan(self, chat_id: int, limit_count: int, offset: int = 0) -> list[int]:
         rows = await self._backend.fetchall(
             """
             SELECT user_id
             FROM tracked_members
             WHERE chat_id = ?
             ORDER BY last_seen_at DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (chat_id, limit_count),
+            (chat_id, limit_count, offset),
         )
         return [int(r[0]) for r in rows]
+
+    async def count_tracked_members(self, chat_id: int) -> int:
+        row = await self._backend.fetchone(
+            "SELECT COUNT(*) FROM tracked_members WHERE chat_id = ?",
+            (chat_id,),
+        )
+        return int(row[0]) if row else 0
 
     async def set_member_check_result(
         self,
