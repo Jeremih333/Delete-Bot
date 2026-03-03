@@ -18,6 +18,7 @@ class Config:
     hybrid_queue_threshold: int
     hybrid_scan_soft_timeout_ms: int
     worker_chat_concurrency: int
+    auto_enqueue_in_web: bool
 
     db_backend: str
     db_path: str
@@ -32,6 +33,11 @@ def _parse_int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _parse_dev_telegram_ids() -> tuple[int, ...]:
@@ -82,6 +88,7 @@ def load_config() -> Config:
         hybrid_queue_threshold=_parse_int_env("HYBRID_QUEUE_THRESHOLD", 1000),
         hybrid_scan_soft_timeout_ms=_parse_int_env("HYBRID_SCAN_SOFT_TIMEOUT_MS", 300000),
         worker_chat_concurrency=max(1, _parse_int_env("WORKER_CHAT_CONCURRENCY", 16)),
+        auto_enqueue_in_web=_parse_bool_env("AUTO_ENQUEUE_IN_WEB", False),
         db_backend=os.getenv("DB_BACKEND", "sqlite").strip().lower(),
         db_path=os.getenv("DB_PATH", "bot.db"),
         cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip(),

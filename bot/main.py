@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -15,6 +16,7 @@ from aiogram.types import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeDefault,
     CallbackQuery,
+    ChatJoinRequest,
     ChatMemberUpdated,
     InlineKeyboardMarkup,
     Message,
@@ -141,6 +143,10 @@ def _readd_kb(chat_type: str) -> InlineKeyboardMarkup:
 
 
 async def _guard_owner_chat_access(c: CallbackQuery, chat_id: int) -> tuple[int, str, str, int, int] | None:
+    try:
+        await db.track_recent_activity(chat_id, c.from_user.id)
+    except Exception:
+        pass
     chat_data = await db.get_managed_chat(chat_id)
     if not chat_data:
         await c.answer("Чат не найден", show_alert=True)
@@ -303,6 +309,13 @@ async def _safe_edit_text(c: CallbackQuery, text: str, reply_markup: InlineKeybo
     except Exception:
         # If message is unchanged or cannot be edited, send a fresh message.
         await c.message.answer(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+
+async def _safe_callback_answer(c: CallbackQuery, text: str | None = None, show_alert: bool = False):
+    try:
+        await c.answer(text, show_alert=show_alert)
+    except Exception:
+        pass
 
 
 def _admin_display_name(username: str | None, full_name: str | None, user_id: int) -> str:
@@ -486,6 +499,37 @@ async def _compute_scan_limit(bot: Bot, db: Database, chat_id: int, premium: boo
     )
 
 
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def _maybe_sync_chat_admins(bot: Bot, chat_id: int, owner_user_id: int) -> None:
+    # Bot API cannot enumerate all members, so we at least keep the admin layer fresh.
+    health = await db.get_chat_health(chat_id)
+    last_sync_at = _parse_iso_utc(health[1]) if health else None
+    now = datetime.now(timezone.utc)
+    if last_sync_at and (now - last_sync_at) < timedelta(hours=6):
+        return
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except Exception:
+        return
+    for admin in admins:
+        if admin.user.is_bot:
+            continue
+        await db.track_recent_activity(chat_id, admin.user.id)
+        await db.grant_chat_admin(chat_id, admin.user.id, owner_user_id)
+    await db.touch_chat_health(chat_id, last_external_sync_at=now.isoformat())
+
+
 async def auto_enqueue_loop(bot: Bot):
     while True:
         try:
@@ -495,6 +539,7 @@ async def auto_enqueue_loop(bot: Bot):
                 if not chat_data or chat_data[4] == 0:
                     continue
                 owner_user_id = chat_data[3]
+                await _maybe_sync_chat_admins(bot, chat_id, owner_user_id)
                 premium = await db.is_premium(owner_user_id)
                 interval, _dd, _df, _di, _days, _action = await db.enforce_plan_limits(chat_id, premium)
                 limit_count = await _compute_scan_limit(bot, db, chat_id, premium)
@@ -689,7 +734,7 @@ async def cmd_settings(m: Message):
 @dp.callback_query(F.data.startswith("settings:list:page:"))
 async def cb_settings_list_page(c: CallbackQuery):
     page = int(c.data.split(":")[-1])
-    await c.answer()
+    await _safe_callback_answer(c)
     text, kb = await _settings_page_payload(c.from_user.id, page)
     await _safe_edit_text(c, text, kb)
 
@@ -706,7 +751,7 @@ async def cb_settings_chat(c: CallbackQuery):
         premium,
     )
     text = await render_chat_settings_text(chat_id)
-    await c.answer()
+    await _safe_callback_answer(c)
     await _safe_edit_text(
         c,
         text,
@@ -729,7 +774,7 @@ async def cb_toggle_deleted(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     premium = await db.is_premium(chat_data[3])
     interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
         chat_id,
@@ -763,7 +808,7 @@ async def cb_toggle_frozen(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     premium = await db.is_premium(chat_data[3])
     if not can_use_feature(premium, FEATURE_FROZEN_DELETE).allowed:
         await db.enforce_plan_limits(chat_id, False)
@@ -795,7 +840,7 @@ async def cb_toggle_action(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     premium = await db.is_premium(chat_data[3])
     interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
         chat_id,
@@ -830,7 +875,7 @@ async def cb_toggle_inactive(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     premium = await db.is_premium(chat_data[3])
     if not can_use_feature(premium, FEATURE_INACTIVE_DELETE).allowed:
         await db.enforce_plan_limits(chat_id, False)
@@ -862,7 +907,7 @@ async def cb_inactive_days(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     premium = await db.is_premium(chat_data[3])
     if not can_use_feature(premium, FEATURE_INACTIVE_DELETE).allowed:
         await db.enforce_plan_limits(chat_id, False)
@@ -905,7 +950,7 @@ async def cb_interval(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     premium = await db.is_premium(chat_data[3])
     if seconds in (3600, 60, 30) and not can_use_feature(premium, FEATURE_INTERVAL_FAST).allowed:
         await db.enforce_plan_limits(chat_id, False)
@@ -939,7 +984,7 @@ async def cb_sync_admins(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     try:
         admins = await c.bot.get_chat_administrators(chat_id)
     except Exception:
@@ -984,7 +1029,7 @@ async def cb_admins_page(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    await c.answer()
+    await _safe_callback_answer(c)
     text, kb = await _admin_access_payload(c.bot, chat_id, page)
     await _safe_edit_text(c, text, kb)
 
@@ -1017,7 +1062,7 @@ async def _toggle_admin_access(c: CallbackQuery, chat_id: int, target_user_id: i
         await c.answer("Пользователь больше не является администратором чата.", show_alert=True)
         return
 
-    await c.answer()
+    await _safe_callback_answer(c)
     has_access = await db.has_chat_admin_access(chat_id, target_user_id)
     if has_access:
         await db.revoke_chat_admin(chat_id, target_user_id)
@@ -1265,6 +1310,12 @@ async def on_chat_member(update: ChatMemberUpdated):
         await db.track_recent_activity(update.chat.id, update.new_chat_member.user.id)
 
 
+@dp.chat_join_request()
+async def on_chat_join_request(update: ChatJoinRequest):
+    if update.chat.type in {"group", "supergroup"} and update.from_user and not update.from_user.is_bot:
+        await db.track_recent_activity(update.chat.id, update.from_user.id)
+
+
 @dp.my_chat_member()
 async def on_my_chat_member(update: ChatMemberUpdated):
     chat_id = update.chat.id
@@ -1380,11 +1431,14 @@ async def main():
     bot = Bot(cfg.bot_token)
     await register_commands(bot)
     runner = await start_health_server()
-    scheduler_task = asyncio.create_task(auto_enqueue_loop(bot))
+    scheduler_task = None
+    if cfg.auto_enqueue_in_web:
+        scheduler_task = asyncio.create_task(auto_enqueue_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
-        scheduler_task.cancel()
+        if scheduler_task:
+            scheduler_task.cancel()
         if runner:
             await runner.cleanup()
 
