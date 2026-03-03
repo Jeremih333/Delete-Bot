@@ -193,7 +193,7 @@ async def _settings_page_payload(owner_user_id: int, page: int) -> tuple[str, In
 
 def _format_premium_text() -> str:
     return (
-        "💎 *Premium для автоматической модерации*\n\n"
+        "💎 <b>Premium для автоматической модерации</b>\n\n"
         "Преимущества:\n"
         "• интервалы 1 час / 1 минута / 30 секунд\n"
         "• удаление замороженных аккаунтов\n"
@@ -201,17 +201,17 @@ def _format_premium_text() -> str:
         "• приоритет в очереди worker\n"
         "• повышенный лимит проверки\n"
         "• больше подключений: до 50 чатов и 45 каналов\n\n"
-        "*Free-план:*\n"
+        "<b>Free-план:</b>\n"
         "• интервал 4 часа\n"
         "• удаление удаленных аккаунтов\n"
         "• до 3 500 участников за цикл\n"
         "• до 3 чатов и 2 каналов\n\n"
-        "*Тарифы:*\n"
-        "• 1 месяц — *199₽*\n"
-        "• 3 месяца — *499₽* ~599₽~\n"
-        "• 6 месяцев — *959₽* ~1194₽~\n"
-        "• 12 месяцев — *1999₽* ~2388₽~\n\n"
-        f"Поддержка: {cfg.support_url}"
+        "<b>Тарифы:</b>\n"
+        "• 1 месяц — <b>199₽</b>\n"
+        "• 3 месяца — <b>499₽</b> <s>599₽</s>\n"
+        "• 6 месяцев — <b>959₽</b> <s>1194₽</s>\n"
+        "• 12 месяцев — <b>1999₽</b> <s>2388₽</s>\n\n"
+        f"Поддержка: <a href=\"{cfg.support_url}\">{cfg.support_url}</a>"
     )
 
 
@@ -332,7 +332,7 @@ async def cmd_premium(m: Message):
     await m.answer(
         _format_premium_text()
         + "\n\n⚠️ Ограничение платформы: для каналов Telegram не предоставляет боту полный контроль подписчиков.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=premium_kb(
             cfg.tarif_message_1,
