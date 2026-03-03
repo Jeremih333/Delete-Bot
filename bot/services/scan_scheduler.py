@@ -4,8 +4,11 @@ from bot.db import Database
 
 
 def make_window_key(chat_id: int, interval_seconds: int, source: str = "auto") -> str:
+    # Keep source argument for backward compatibility, but do not include it in dedupe key.
+    # This guarantees that Render and GitHub worker share the same idempotency window.
+    _ = source
     now_bucket = int(datetime.now(timezone.utc).timestamp() // max(1, interval_seconds))
-    return f"{source}:{chat_id}:{now_bucket}"
+    return f"{chat_id}:{now_bucket}"
 
 
 async def enqueue_scan_if_absent(
@@ -22,4 +25,3 @@ async def enqueue_scan_if_absent(
         limit_count=limit_count,
         priority=priority,
     )
-
