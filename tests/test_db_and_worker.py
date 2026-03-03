@@ -88,6 +88,19 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claimed[0][1], -2)
         self.assertEqual(claimed[1][1], -1)
 
+    async def test_enqueue_scan_job_if_absent(self):
+        ok1 = await self.db.enqueue_scan_job_if_absent(chat_id=-10, window_key="w:1", limit_count=100, priority=0)
+        ok2 = await self.db.enqueue_scan_job_if_absent(chat_id=-10, window_key="w:1", limit_count=100, priority=0)
+        claimed = await self.db.claim_pending_scan_jobs(limit=10)
+        self.assertTrue(ok1)
+        self.assertTrue(ok2)  # conflict is ignored but key exists after first enqueue
+        self.assertEqual(len([j for j in claimed if j[1] == -10]), 1)
+
+    async def test_get_scan_target(self):
+        self.assertEqual(self.db.get_scan_target(chat_id=-1, owner_is_premium=False, known_members=2000, chat_member_count=5000), 2000)
+        self.assertEqual(self.db.get_scan_target(chat_id=-1, owner_is_premium=False, known_members=5000, chat_member_count=5000), 3500)
+        self.assertEqual(self.db.get_scan_target(chat_id=-1, owner_is_premium=True, known_members=5000, chat_member_count=5000), 5000)
+
     async def test_due_auto_enqueue(self):
         await self.db.upsert_managed_chat(chat_id=-100001, title="A", owner_user_id=1, chat_type="supergroup")
         due = await self.db.list_chats_due_for_auto_enqueue(limit=10)
@@ -130,7 +143,7 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         fake_bot = AsyncMock()
         fake_bot.get_chat_member.return_value = fake_member
 
-        processed, removed, errors, delete_task = await process_job(
+        processed, removed, errors, delete_task, report_total, timed_out = await process_job(
             bot=fake_bot,
             db=self.db,
             job_id=job_id,
@@ -141,6 +154,8 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed, 1)
         self.assertEqual(removed, 1)
         self.assertEqual(errors, 0)
+        self.assertGreaterEqual(report_total, 1)
+        self.assertFalse(timed_out)
         if delete_task:
             delete_task.cancel()
 
