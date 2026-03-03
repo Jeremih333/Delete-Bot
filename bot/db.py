@@ -94,6 +94,7 @@ TABLE_STATEMENTS = [
       processed INTEGER NOT NULL DEFAULT 0,
       removed_deleted INTEGER NOT NULL DEFAULT 0,
       removed_frozen INTEGER NOT NULL DEFAULT 0,
+      removed_inactive INTEGER NOT NULL DEFAULT 0,
       rate_limited_count INTEGER NOT NULL DEFAULT 0,
       errors INTEGER NOT NULL DEFAULT 0,
       timed_out INTEGER NOT NULL DEFAULT 0,
@@ -140,6 +141,7 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE tracked_members ADD COLUMN transient_errors INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE scan_runs ADD COLUMN chat_total INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE scan_runs ADD COLUMN rate_limited_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE scan_runs ADD COLUMN removed_inactive INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE chat_health ADD COLUMN last_external_sync_at TEXT",
 ]
 
@@ -642,7 +644,6 @@ class Database:
             """,
             (chat_id, user_id, now_iso, now_iso, source, now_iso),
         )
-        await self.touch_chat_health(chat_id, last_event_at=now_iso)
 
     async def track_recent_activity(self, chat_id: int, user_id: int, source: str = "bot_event"):
         await self.track_member(chat_id, user_id, source=source)
@@ -897,6 +898,7 @@ class Database:
         processed: int,
         removed_deleted: int,
         removed_frozen: int,
+        removed_inactive: int,
         errors: int,
         timed_out: bool,
         rate_limited_count: int = 0,
@@ -909,6 +911,7 @@ class Database:
                 processed = ?,
                 removed_deleted = ?,
                 removed_frozen = ?,
+                removed_inactive = ?,
                 rate_limited_count = ?,
                 errors = ?,
                 timed_out = ?,
@@ -920,6 +923,7 @@ class Database:
                 processed,
                 removed_deleted,
                 removed_frozen,
+                removed_inactive,
                 rate_limited_count,
                 errors,
                 1 if timed_out else 0,
@@ -1012,7 +1016,7 @@ class Database:
         rows = await self._backend.fetchall(
             """
             SELECT id, chat_id, source, started_at, processed, report_total, tracked_total,
-                   removed_deleted + removed_frozen AS removed_total, errors, timed_out
+                   removed_deleted + removed_frozen + removed_inactive AS removed_total, errors, timed_out
             FROM scan_runs
             ORDER BY id DESC
             LIMIT ?

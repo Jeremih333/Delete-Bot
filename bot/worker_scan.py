@@ -21,6 +21,7 @@ class ScanJobResult:
     processed: int
     removed_deleted: int
     removed_frozen: int
+    removed_inactive: int
     errors: int
     rate_limited_count: int
     delete_task: asyncio.Task | None
@@ -69,6 +70,7 @@ async def process_job(
     processed = 0
     removed_deleted = 0
     removed_frozen = 0
+    removed_inactive = 0
     errors = 0
     rate_limited_count = 0
 
@@ -102,8 +104,8 @@ async def process_job(
 
     sem = asyncio.Semaphore(max(1, int(max_concurrency)))
 
-    async def handle_candidate(user_id: int) -> tuple[int, int, int, int, int]:
-        # processed_delta, removed_deleted_delta, removed_frozen_delta, errors_delta, rate_limited_delta
+    async def handle_candidate(user_id: int) -> tuple[int, int, int, int, int, int]:
+        # processed_delta, removed_deleted_delta, removed_frozen_delta, removed_inactive_delta, errors_delta, rate_limited_delta
         async with sem:
             try:
                 member = await bot.get_chat_member(chat_id, user_id)
@@ -119,12 +121,12 @@ async def process_job(
                     await remove_member(bot, chat_id, user_id, moderation_action)
                     await db.set_member_check_result(chat_id, user_id, reason=reason, removed=True)
                     if reason == "deleted":
-                        return 1, 1, 0, 0, 0
+                        return 1, 1, 0, 0, 0, 0
                     if reason == "frozen":
-                        return 1, 0, 1, 0, 0
+                        return 1, 0, 1, 0, 0, 0
                     if reason == "inactive":
-                        return 1, 0, 0, 0, 0
-                return 1, 0, 0, 0, 0
+                        return 1, 0, 0, 1, 0, 0
+                return 1, 0, 0, 0, 0, 0
             except Exception as exc:
                 kind = classify_exception_kind(exc)
                 reason, _ = classify_member_or_error(exc, bool(delete_deleted), bool(delete_frozen))
@@ -137,20 +139,22 @@ async def process_job(
                         error_kind="transient",
                         error_code="transient",
                     )
-                    return 0, 0, 0, 0, 1
+                    return 0, 0, 0, 0, 0, 1
                 if reason:
                     try:
                         await remove_member(bot, chat_id, user_id, moderation_action)
                         await db.set_member_check_result(chat_id, user_id, reason=reason, removed=True, error_kind=kind)
                         if reason == "deleted":
-                            return 1, 1, 0, 0, 0
+                            return 1, 1, 0, 0, 0, 0
                         if reason == "frozen":
-                            return 1, 0, 1, 0, 0
+                            return 1, 0, 1, 0, 0, 0
+                        if reason == "inactive":
+                            return 1, 0, 0, 1, 0, 0
                     except Exception:
                         await db.set_member_check_result(chat_id, user_id, reason=reason, removed=False, error_kind=kind)
-                        return 1, 0, 0, 1, 0
+                        return 1, 0, 0, 0, 1, 0
                 await db.set_member_check_result(chat_id, user_id, reason=None, removed=False, error_kind=kind)
-                return 1, 0, 0, 1, 0
+                return 1, 0, 0, 0, 1, 0
 
     while processed < limit_count and monotonic() < deadline:
         batch_limit = min(chunk_size, limit_count - processed)
@@ -159,10 +163,11 @@ async def process_job(
             break
 
         results = await asyncio.gather(*(handle_candidate(user_id) for user_id in candidate_ids))
-        for p, d, f, e, rl in results:
+        for p, d, f, i, e, rl in results:
             processed += p
             removed_deleted += d
             removed_frozen += f
+            removed_inactive += i
             errors += e
             rate_limited_count += rl
 
@@ -185,13 +190,14 @@ async def process_job(
         f"{coverage_line}\n"
         f"🗑️ Удалено удаленных аккаунтов: *{removed_deleted}*\n"
         f"🧊 Удалено замороженных аккаунтов: *{removed_frozen}*\n"
+        f"🕰️ Удалено давно неактивных: *{removed_inactive}*\n"
         f"⏳ Rate limit событий: *{rate_limited_count}*\n"
         f"⚠️ Ошибок: *{errors}*\n\n"
         "_Это сообщение удалится через 30 секунд._"
     )
 
     delete_task = None
-    if (removed_deleted + removed_frozen) > 0:
+    if (removed_deleted + removed_frozen + removed_inactive) > 0:
         try:
             chat = await bot.get_chat(chat_id)
             if chat.type in {"group", "supergroup"}:
@@ -215,6 +221,7 @@ async def process_job(
         processed=processed,
         removed_deleted=removed_deleted,
         removed_frozen=removed_frozen,
+        removed_inactive=removed_inactive,
         errors=errors,
         rate_limited_count=rate_limited_count,
         timed_out=timed_out,
@@ -228,7 +235,7 @@ async def process_job(
     )
 
     logger.info(
-        "event=scan_job_completed chat_id=%s job_id=%s processed=%s tracked_total=%s chat_total=%s removed_deleted=%s removed_frozen=%s rate_limited=%s errors=%s timed_out=%s",
+        "event=scan_job_completed chat_id=%s job_id=%s processed=%s tracked_total=%s chat_total=%s removed_deleted=%s removed_frozen=%s removed_inactive=%s rate_limited=%s errors=%s timed_out=%s",
         chat_id,
         job_id,
         processed,
@@ -236,6 +243,7 @@ async def process_job(
         report_chat_total,
         removed_deleted,
         removed_frozen,
+        removed_inactive,
         rate_limited_count,
         errors,
         int(timed_out),
@@ -245,6 +253,7 @@ async def process_job(
         processed,
         removed_deleted,
         removed_frozen,
+        removed_inactive,
         errors,
         rate_limited_count,
         delete_task,
@@ -283,6 +292,7 @@ async def run_worker():
                     _processed,
                     removed_deleted,
                     removed_frozen,
+                    removed_inactive,
                     errors,
                     _rate_limited,
                     delete_task,
@@ -298,7 +308,7 @@ async def run_worker():
                     soft_timeout_ms=cfg.hybrid_scan_soft_timeout_ms,
                     max_concurrency=cfg.worker_chat_concurrency,
                 )
-                removed_total += removed_deleted + removed_frozen
+                removed_total += removed_deleted + removed_frozen + removed_inactive
                 errors_total += errors
                 if delete_task:
                     delete_tasks.append(delete_task)

@@ -94,6 +94,16 @@ logger = logging.getLogger("delete_bot.main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
+def _track_bg(chat_id: int, user_id: int, source: str = "bot_event") -> None:
+    async def _runner():
+        try:
+            await db.track_recent_activity(chat_id, user_id, source=source)
+        except Exception:
+            logger.debug("event=track_bg_failed chat_id=%s user_id=%s", chat_id, user_id)
+
+    asyncio.create_task(_runner())
+
+
 def _md_escape(value: str) -> str:
     return (
         value.replace("\\", "\\\\")
@@ -143,10 +153,7 @@ def _readd_kb(chat_type: str) -> InlineKeyboardMarkup:
 
 
 async def _guard_owner_chat_access(c: CallbackQuery, chat_id: int) -> tuple[int, str, str, int, int] | None:
-    try:
-        await db.track_recent_activity(chat_id, c.from_user.id)
-    except Exception:
-        pass
+    _track_bg(chat_id, c.from_user.id)
     chat_data = await db.get_managed_chat(chat_id)
     if not chat_data:
         await c.answer("Чат не найден", show_alert=True)
@@ -1283,37 +1290,37 @@ async def cmd_check(m: Message):
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def track_message_authors(m: Message):
     if m.from_user:
-        await db.track_recent_activity(m.chat.id, m.from_user.id)
+        _track_bg(m.chat.id, m.from_user.id)
     if m.reply_to_message and m.reply_to_message.from_user:
-        await db.track_recent_activity(m.chat.id, m.reply_to_message.from_user.id)
+        _track_bg(m.chat.id, m.reply_to_message.from_user.id)
     if m.forward_from:
-        await db.track_recent_activity(m.chat.id, m.forward_from.id)
+        _track_bg(m.chat.id, m.forward_from.id)
     if m.new_chat_members:
         for user in m.new_chat_members:
             if user and not user.is_bot:
-                await db.track_recent_activity(m.chat.id, user.id)
+                _track_bg(m.chat.id, user.id)
     if m.left_chat_member and not m.left_chat_member.is_bot:
-        await db.track_recent_activity(m.chat.id, m.left_chat_member.id)
+        _track_bg(m.chat.id, m.left_chat_member.id)
 
 
 @dp.edited_message(F.chat.type.in_({"group", "supergroup"}))
 async def track_edited_message_authors(m: Message):
     if m.from_user:
-        await db.track_recent_activity(m.chat.id, m.from_user.id)
+        _track_bg(m.chat.id, m.from_user.id)
     if m.reply_to_message and m.reply_to_message.from_user:
-        await db.track_recent_activity(m.chat.id, m.reply_to_message.from_user.id)
+        _track_bg(m.chat.id, m.reply_to_message.from_user.id)
 
 
 @dp.chat_member()
 async def on_chat_member(update: ChatMemberUpdated):
     if update.chat.type in {"group", "supergroup"}:
-        await db.track_recent_activity(update.chat.id, update.new_chat_member.user.id)
+        _track_bg(update.chat.id, update.new_chat_member.user.id)
 
 
 @dp.chat_join_request()
 async def on_chat_join_request(update: ChatJoinRequest):
     if update.chat.type in {"group", "supergroup"} and update.from_user and not update.from_user.is_bot:
-        await db.track_recent_activity(update.chat.id, update.from_user.id)
+        _track_bg(update.chat.id, update.from_user.id)
 
 
 @dp.my_chat_member()
@@ -1401,6 +1408,12 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 
     if new_status in {"kicked", "left"}:
         await db.disable_managed_chat(chat_id)
+
+
+@dp.errors()
+async def on_error(event):
+    logger.exception("event=dispatcher_error data=%s", event)
+    return True
 
 
 async def start_health_server() -> web.AppRunner | None:
