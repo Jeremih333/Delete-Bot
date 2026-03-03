@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import os
+import time
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -27,13 +28,39 @@ from bot.db import Database
 from bot.keyboards import dev_kb, premium_kb, start_kb
 from bot.moderation import classify_member_or_error, reason_to_human, remove_member
 from bot.texts.ru import PREMIUM_REQUIRED_ALERT, STATUS_DIAGNOSTICS
-from bot.services.premium_guard import (
-    FEATURE_FROZEN_DELETE,
-    FEATURE_INTERVAL_FAST,
-    FEATURE_KICK_MODE,
-    can_use_feature,
-)
-from bot.services.scan_scheduler import enqueue_scan_if_absent
+try:
+    from bot.services.premium_guard import (
+        FEATURE_FROZEN_DELETE,
+        FEATURE_INTERVAL_FAST,
+        FEATURE_KICK_MODE,
+        can_use_feature,
+    )
+except ModuleNotFoundError:
+    FEATURE_FROZEN_DELETE = "frozen_delete"
+    FEATURE_INTERVAL_FAST = "interval_fast"
+    FEATURE_KICK_MODE = "kick_mode"
+
+    async def can_use_feature(_db: Database, user_id: int, _chat_id: int, feature: str) -> tuple[bool, str]:
+        is_premium = await _db.has_active_premium(user_id)
+        if feature in (FEATURE_FROZEN_DELETE, FEATURE_INTERVAL_FAST, FEATURE_KICK_MODE) and not is_premium:
+            return False, "premium_required"
+        return True, "ok"
+
+try:
+    from bot.services.scan_scheduler import enqueue_scan_if_absent
+except ModuleNotFoundError:
+    async def enqueue_scan_if_absent(
+        _db: Database,
+        *,
+        chat_id: int,
+        interval_seconds: int,
+        limit_count: int,
+        priority: int = 5,
+    ) -> bool:
+        now = int(time.time())
+        bucket = now // max(1, int(interval_seconds))
+        window_key = f"{chat_id}:{interval_seconds}:{bucket}"
+        return await _db.enqueue_scan_job_if_absent(chat_id, window_key, limit_count, priority)
 
 
 class DevGrant(StatesGroup):
