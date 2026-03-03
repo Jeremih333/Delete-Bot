@@ -130,7 +130,7 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         fake_bot = AsyncMock()
         fake_bot.get_chat_member.return_value = fake_member
 
-        processed, removed, errors = await process_job(
+        processed, removed, errors, delete_task = await process_job(
             bot=fake_bot,
             db=self.db,
             job_id=job_id,
@@ -141,6 +141,8 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed, 1)
         self.assertEqual(removed, 1)
         self.assertEqual(errors, 0)
+        if delete_task:
+            delete_task.cancel()
 
     async def test_run_worker_processes_queue(self):
         await self.db.ensure_chat_settings(-100555)
