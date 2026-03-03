@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 10
     env:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
-      DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
+      DB_BACKEND: ${{ secrets.DB_BACKEND || 'cloudflare_d1' }}
       DB_PATH: ${{ secrets.DB_PATH || 'bot.db' }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
@@ -38,7 +38,7 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          backend = os.getenv("DB_BACKEND", "sqlite")
+          backend = os.getenv("DB_BACKEND", "cloudflare_d1")
           assert os.getenv("BOT_TOKEN"), "BOT_TOKEN is missing"
           if backend == "cloudflare_d1":
               assert os.getenv("CLOUDFLARE_ACCOUNT_ID"), "CLOUDFLARE_ACCOUNT_ID is missing"
@@ -58,7 +58,7 @@ jobs:
           async def main():
               db = Database(
                   path=os.getenv("DB_PATH", "bot.db"),
-                  backend=os.getenv("DB_BACKEND", "sqlite"),
+                  backend=os.getenv("DB_BACKEND", "cloudflare_d1"),
                   cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""),
                   cloudflare_d1_database_id=os.getenv("CLOUDFLARE_D1_DATABASE_ID", ""),
                   cloudflare_api_token=os.getenv("CLOUDFLARE_API_TOKEN", ""),
