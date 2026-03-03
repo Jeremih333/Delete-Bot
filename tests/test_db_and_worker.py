@@ -2,9 +2,12 @@ import os
 import tempfile
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from bot.db import Database
-from bot.worker_scan import run_worker
+from bot.moderation import classify_member
+from bot.worker_scan import process_job, run_worker
 
 
 class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
@@ -26,62 +29,124 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
         first = await self.db.get_subscription(1001)
         await self.db.set_subscription(user_id=1001, months=1, granted_by=777)
         second = await self.db.get_subscription(1001)
+        self.assertGreater(datetime.fromisoformat(second[2]), datetime.fromisoformat(first[2]))
 
-        first_exp = datetime.fromisoformat(first[2])
-        second_exp = datetime.fromisoformat(second[2])
-        self.assertGreater(second_exp, first_exp)
+    async def test_managed_chat_and_admin_access(self):
+        await self.db.upsert_managed_chat(chat_id=-100123, title="Test Chat", owner_user_id=42)
+        row = await self.db.get_managed_chat(-100123)
+        self.assertIsNotNone(row)
+        self.assertEqual(row[2], 42)
+        self.assertTrue(await self.db.has_chat_admin_access(-100123, 42))
 
-    async def test_remaining_and_active_subscribers(self):
-        await self.db.set_subscription(user_id=2002, months=1, granted_by=777)
-        remaining = await self.db.premium_remaining_seconds(2002)
-        active = await self.db.list_active_subscribers(limit=10)
-
-        self.assertGreater(remaining, 0)
-        self.assertTrue(any(row[0] == 2002 for row in active))
+        await self.db.grant_chat_admin(-100123, 99, 42)
+        self.assertTrue(await self.db.has_chat_admin_access(-100123, 99))
+        await self.db.revoke_chat_admin(-100123, 99)
+        self.assertFalse(await self.db.has_chat_admin_access(-100123, 99))
 
     async def test_chat_settings_default_and_update(self):
-        interval, frozen = await self.db.get_chat_settings(chat_id=-100123)
+        await self.db.ensure_chat_settings(-100123)
+        interval, delete_deleted, delete_frozen, moderation_action = await self.db.get_chat_settings(chat_id=-100123)
         self.assertEqual(interval, 3600)
-        self.assertEqual(frozen, 0)
+        self.assertEqual(delete_deleted, 1)
+        self.assertEqual(delete_frozen, 0)
+        self.assertEqual(moderation_action, "ban")
 
         await self.db.set_interval(chat_id=-100123, seconds=60)
+        await self.db.set_delete_deleted(chat_id=-100123, enabled=False)
         await self.db.set_frozen(chat_id=-100123, enabled=True)
-        interval2, frozen2 = await self.db.get_chat_settings(chat_id=-100123)
+        await self.db.set_moderation_action(chat_id=-100123, action="kick")
+        interval2, deleted2, frozen2, action2 = await self.db.get_chat_settings(chat_id=-100123)
         self.assertEqual(interval2, 60)
+        self.assertEqual(deleted2, 0)
         self.assertEqual(frozen2, 1)
+        self.assertEqual(action2, "kick")
 
-    async def test_scan_jobs_claim_and_complete(self):
-        await self.db.add_scan_job(chat_id=-100001, limit_count=20)
-        await self.db.add_scan_job(chat_id=-100002, limit_count=30)
+    async def test_scan_jobs_priority_order(self):
+        await self.db.add_scan_job(chat_id=-1, limit_count=10, priority=0)
+        await self.db.add_scan_job(chat_id=-2, limit_count=10, priority=1)
+        claimed = await self.db.claim_pending_scan_jobs(limit=2)
+        self.assertEqual(claimed[0][1], -2)
+        self.assertEqual(claimed[1][1], -1)
 
-        claimed = await self.db.claim_pending_scan_jobs(limit=20)
-        self.assertEqual(len(claimed), 2)
+    async def test_due_auto_enqueue(self):
+        await self.db.upsert_managed_chat(chat_id=-100001, title="A", owner_user_id=1)
+        due = await self.db.list_chats_due_for_auto_enqueue(limit=10)
+        self.assertIn(-100001, due)
+        await self.db.touch_chat_auto_enqueue(-100001)
+        due2 = await self.db.list_chats_due_for_auto_enqueue(limit=10)
+        self.assertNotIn(-100001, due2)
 
-        for job_id, _, _ in claimed:
-            await self.db.set_scan_job_status(job_id, "done", set_finished_at=True)
+    async def test_track_members(self):
+        await self.db.track_member(chat_id=-100001, user_id=10)
+        await self.db.track_member(chat_id=-100001, user_id=11)
+        members = await self.db.get_tracked_members_for_scan(chat_id=-100001, limit_count=10)
+        self.assertEqual(set(members), {10, 11})
 
-        pending = await self.db.pending_jobs_count()
-        self.assertEqual(pending, 0)
+    async def test_classify_member_rules(self):
+        deleted_member = SimpleNamespace(user=SimpleNamespace(first_name="Deleted Account"))
+        frozen_member = SimpleNamespace(user=SimpleNamespace(first_name="John", is_fake=True, is_scam=False))
+        normal_member = SimpleNamespace(user=SimpleNamespace(first_name="Alice", is_fake=False, is_scam=False))
 
-    async def test_worker_processes_pending_jobs(self):
-        await self.db.add_scan_job(chat_id=-100111, limit_count=50)
-        await self.db.add_scan_job(chat_id=-100222, limit_count=60)
+        self.assertEqual(classify_member(deleted_member, delete_deleted_enabled=True, delete_frozen_enabled=False), "deleted")
+        self.assertEqual(classify_member(frozen_member, delete_deleted_enabled=False, delete_frozen_enabled=True), "frozen")
+        self.assertIsNone(classify_member(normal_member, delete_deleted_enabled=True, delete_frozen_enabled=True))
 
-        prev_backend = os.environ.get("DB_BACKEND")
-        prev_db_path = os.environ.get("DB_PATH")
+    async def test_process_job_removes_deleted(self):
+        await self.db.ensure_chat_settings(-100001)
+        await self.db.track_member(chat_id=-100001, user_id=42)
+        await self.db.add_scan_job(chat_id=-100001, limit_count=100, priority=0)
+        claimed = await self.db.claim_pending_scan_jobs(limit=1)
+        job_id, chat_id, limit_count = claimed[0]
+
+        fake_member = SimpleNamespace(user=SimpleNamespace(first_name="Deleted Account", is_fake=False, is_scam=False))
+        fake_bot = AsyncMock()
+        fake_bot.get_chat_member.return_value = fake_member
+
+        processed, removed, errors = await process_job(
+            bot=fake_bot,
+            db=self.db,
+            job_id=job_id,
+            chat_id=chat_id,
+            limit_count=limit_count,
+            soft_timeout_ms=2000,
+        )
+        self.assertEqual(processed, 1)
+        self.assertEqual(removed, 1)
+        self.assertEqual(errors, 0)
+
+    async def test_run_worker_processes_queue(self):
+        await self.db.ensure_chat_settings(-100555)
+        await self.db.track_member(chat_id=-100555, user_id=55)
+        await self.db.add_scan_job(chat_id=-100555, limit_count=100, priority=0)
+
+        prev = {k: os.environ.get(k) for k in ("DB_BACKEND", "DB_PATH", "BOT_TOKEN")}
+        os.environ["DB_BACKEND"] = "sqlite"
+        os.environ["DB_PATH"] = self.db_path
+        os.environ["BOT_TOKEN"] = "123456:TEST"
+
+        fake_member = SimpleNamespace(user=SimpleNamespace(first_name="Deleted Account", is_fake=False, is_scam=False))
+        fake_bot = AsyncMock()
+        fake_bot.get_chat_member.return_value = fake_member
+
+        class FakeBotCM:
+            def __init__(self, *_args, **_kwargs):
+                self.inner = fake_bot
+
+            async def __aenter__(self):
+                return self.inner
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
         try:
-            os.environ["DB_BACKEND"] = "sqlite"
-            os.environ["DB_PATH"] = self.db_path
-            await run_worker()
+            with patch("bot.worker_scan.Bot", FakeBotCM):
+                await run_worker()
         finally:
-            if prev_backend is None:
-                os.environ.pop("DB_BACKEND", None)
-            else:
-                os.environ["DB_BACKEND"] = prev_backend
-            if prev_db_path is None:
-                os.environ.pop("DB_PATH", None)
-            else:
-                os.environ["DB_PATH"] = prev_db_path
+            for key, value in prev.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
         pending = await self.db.pending_jobs_count()
         self.assertEqual(pending, 0)
