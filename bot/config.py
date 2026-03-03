@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+import re
 
 
 @dataclass
@@ -45,13 +46,26 @@ def _parse_dev_telegram_ids() -> tuple[int, ...]:
                 continue
         return tuple(parsed)
 
-    legacy_id = os.getenv("DEV_TELEGRAM_ID", "0").strip()
-    if not legacy_id or legacy_id == "0":
-        return tuple()
-    try:
-        return (int(legacy_id),)
-    except ValueError:
-        return tuple()
+    collected: list[int] = []
+    for key, value in os.environ.items():
+        if not re.fullmatch(r"DEV_TELEGRAM_ID(?:_\d+)?", key):
+            continue
+        raw = value.strip()
+        if not raw or raw == "0":
+            continue
+        try:
+            collected.append(int(raw))
+        except ValueError:
+            continue
+    # Preserve deterministic order and remove duplicates.
+    seen: set[int] = set()
+    result: list[int] = []
+    for item in sorted(collected):
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return tuple(result)
 
 
 
