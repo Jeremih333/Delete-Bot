@@ -5,9 +5,11 @@ def start_kb(bot_username: str):
     username = bot_username.strip().lstrip("@")
     b = InlineKeyboardBuilder()
     b.button(
-        text="➕ Добавить бота в чат",
+        text="➕ Добавить в группу",
         url=f"https://t.me/{username}?startgroup=true" if username else "https://t.me/",
     )
+    b.button(text="⚙️ Открыть настройки", switch_inline_query_current_chat="/settings")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -24,10 +26,10 @@ def premium_kb(url1: str, url3: str, url6: str, url12: str):
 def settings_kb(is_premium: bool):
     lock = "" if is_premium else "🔒 "
     b = InlineKeyboardBuilder()
-    b.button(text="⏱️ Интервал: часы", callback_data="set:interval:hours")
-    b.button(text=f"{lock}Интервал: минуты", callback_data="set:interval:minutes")
-    b.button(text=f"{lock}Интервал: секунды", callback_data="set:interval:seconds")
-    b.button(text=f"{lock}Frozen автоудаление", callback_data="set:frozen:toggle")
+    b.button(text="⏱ Интервал: 1 час", callback_data="set:interval:hours")
+    b.button(text=f"{lock}Интервал: 1 минута", callback_data="set:interval:minutes")
+    b.button(text=f"{lock}Интервал: 30 секунд", callback_data="set:interval:seconds")
+    b.button(text=f"{lock}Удалять fake/scam", callback_data="set:frozen:toggle")
     b.adjust(1)
     return b.as_markup()
 

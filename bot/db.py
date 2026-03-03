@@ -18,17 +18,43 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS chat_settings (
+    CREATE TABLE IF NOT EXISTS managed_chats (
       chat_id INTEGER PRIMARY KEY,
-      check_interval_seconds INTEGER NOT NULL DEFAULT 3600,
-      delete_frozen_enabled INTEGER NOT NULL DEFAULT 0
+      title TEXT,
+      owner_user_id INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_auto_enqueue_at TEXT
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS roles (
+    CREATE TABLE IF NOT EXISTS chat_admin_access (
       chat_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      role TEXT NOT NULL,
+      granted_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (chat_id, user_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS chat_settings (
+      chat_id INTEGER PRIMARY KEY,
+      check_interval_seconds INTEGER NOT NULL DEFAULT 3600,
+      delete_deleted_enabled INTEGER NOT NULL DEFAULT 1,
+      delete_frozen_enabled INTEGER NOT NULL DEFAULT 0,
+      moderation_action TEXT NOT NULL DEFAULT 'ban'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tracked_members (
+      chat_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      last_checked_at TEXT,
+      last_reason TEXT,
+      removed_at TEXT,
       PRIMARY KEY (chat_id, user_id)
     )
     """,
@@ -37,13 +63,22 @@ SCHEMA_STATEMENTS = [
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
       limit_count INTEGER NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TEXT NOT NULL,
       finished_at TEXT
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_scan_jobs_status_id ON scan_jobs(status, id)",
+    "CREATE INDEX IF NOT EXISTS idx_scan_jobs_status_priority_id ON scan_jobs(status, priority, id)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_expires ON subscriptions(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tracked_members_chat_last_seen ON tracked_members(chat_id, last_seen_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_managed_chats_owner ON managed_chats(owner_user_id, enabled)",
+]
+
+MIGRATION_STATEMENTS = [
+    "ALTER TABLE scan_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE chat_settings ADD COLUMN delete_deleted_enabled INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE chat_settings ADD COLUMN moderation_action TEXT NOT NULL DEFAULT 'ban'",
 ]
 
 
@@ -67,19 +102,22 @@ class _SQLiteBackend:
         async with aiosqlite.connect(self.path) as db:
             for statement in SCHEMA_STATEMENTS:
                 await db.execute(statement)
+            for statement in MIGRATION_STATEMENTS:
+                try:
+                    await db.execute(statement)
+                except aiosqlite.OperationalError:
+                    pass
             await db.commit()
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(sql, params)
-            row = await cur.fetchone()
-            return row
+            return await cur.fetchone()
 
     async def fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(sql, params)
-            rows = await cur.fetchall()
-            return rows
+            return await cur.fetchall()
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()):
         async with aiosqlite.connect(self.path) as db:
@@ -117,8 +155,7 @@ class _CloudflareD1Backend:
 
         data = json.loads(text)
         if not data.get("success", False):
-            errors = data.get("errors", [])
-            raise RuntimeError(f"D1 request failed: {errors}")
+            raise RuntimeError(f"D1 request failed: {data.get('errors', [])}")
 
         result = data.get("result") or []
         if not result:
@@ -132,6 +169,11 @@ class _CloudflareD1Backend:
     async def init(self):
         for statement in SCHEMA_STATEMENTS:
             await self._request(statement)
+        for statement in MIGRATION_STATEMENTS:
+            try:
+                await self._request(statement)
+            except RuntimeError:
+                pass
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
         rows = await self.fetchall(sql, params)
@@ -247,38 +289,87 @@ class Database:
         )
         return [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
 
-    async def add_helper(self, chat_id: int, user_id: int):
+    async def upsert_managed_chat(self, chat_id: int, title: str, owner_user_id: int):
+        now_iso = _iso_now()
         await self._backend.execute(
-            "INSERT OR REPLACE INTO roles(chat_id, user_id, role) VALUES(?, ?, 'helper')",
-            (chat_id, user_id),
+            """
+            INSERT INTO managed_chats(chat_id, title, owner_user_id, enabled, created_at, updated_at)
+            VALUES(?, ?, ?, 1, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+              title=excluded.title,
+              owner_user_id=excluded.owner_user_id,
+              enabled=1,
+              updated_at=excluded.updated_at
+            """,
+            (chat_id, title, owner_user_id, now_iso, now_iso),
+        )
+        await self.ensure_chat_settings(chat_id)
+        await self.grant_chat_admin(chat_id, owner_user_id, owner_user_id)
+
+    async def disable_managed_chat(self, chat_id: int):
+        await self._backend.execute(
+            "UPDATE managed_chats SET enabled = 0, updated_at = ? WHERE chat_id = ?",
+            (_iso_now(), chat_id),
         )
 
-    async def get_role(self, chat_id: int, user_id: int):
-        row = await self._backend.fetchone(
-            "SELECT role FROM roles WHERE chat_id = ? AND user_id = ?",
-            (chat_id, user_id),
+    async def list_owner_chats(self, owner_user_id: int) -> list[tuple[int, str, int]]:
+        rows = await self._backend.fetchall(
+            """
+            SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)), enabled
+            FROM managed_chats
+            WHERE owner_user_id = ?
+            ORDER BY updated_at DESC
+            """,
+            (owner_user_id,),
         )
-        return row[0] if row else None
+        return [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+
+    async def get_managed_chat(self, chat_id: int) -> tuple[int, str, int, int] | None:
+        row = await self._backend.fetchone(
+            """
+            SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)), owner_user_id, enabled
+            FROM managed_chats
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+        if not row:
+            return None
+        return (int(row[0]), str(row[1]), int(row[2]), int(row[3]))
 
     async def ensure_chat_settings(self, chat_id: int):
-        await self._backend.execute(
-            "INSERT OR IGNORE INTO chat_settings(chat_id) VALUES(?)",
-            (chat_id,),
-        )
+        await self._backend.execute("INSERT OR IGNORE INTO chat_settings(chat_id) VALUES(?)", (chat_id,))
 
-    async def get_chat_settings(self, chat_id: int):
+    async def get_chat_settings(self, chat_id: int) -> tuple[int, int, int, str]:
         await self.ensure_chat_settings(chat_id)
         row = await self._backend.fetchone(
-            "SELECT check_interval_seconds, delete_frozen_enabled FROM chat_settings WHERE chat_id = ?",
+            """
+            SELECT check_interval_seconds, delete_deleted_enabled, delete_frozen_enabled, moderation_action
+            FROM chat_settings
+            WHERE chat_id = ?
+            """,
             (chat_id,),
         )
-        return row if row else (3600, 0)
+        if not row:
+            return (3600, 1, 0, "ban")
+        interval, delete_deleted, delete_frozen, action = row
+        action_norm = str(action or "ban").lower()
+        if action_norm not in {"ban", "kick"}:
+            action_norm = "ban"
+        return (int(interval), int(delete_deleted), int(delete_frozen), action_norm)
 
     async def set_interval(self, chat_id: int, seconds: int):
         await self.ensure_chat_settings(chat_id)
         await self._backend.execute(
             "UPDATE chat_settings SET check_interval_seconds = ? WHERE chat_id = ?",
             (seconds, chat_id),
+        )
+
+    async def set_delete_deleted(self, chat_id: int, enabled: bool):
+        await self.ensure_chat_settings(chat_id)
+        await self._backend.execute(
+            "UPDATE chat_settings SET delete_deleted_enabled = ? WHERE chat_id = ?",
+            (1 if enabled else 0, chat_id),
         )
 
     async def set_frozen(self, chat_id: int, enabled: bool):
@@ -288,16 +379,97 @@ class Database:
             (1 if enabled else 0, chat_id),
         )
 
-    async def add_scan_job(self, chat_id: int, limit_count: int):
+    async def set_moderation_action(self, chat_id: int, action: str):
+        await self.ensure_chat_settings(chat_id)
+        action_norm = action.lower().strip()
+        if action_norm not in {"ban", "kick"}:
+            action_norm = "ban"
         await self._backend.execute(
-            "INSERT INTO scan_jobs(chat_id, limit_count, created_at) VALUES(?, ?, ?)",
-            (chat_id, limit_count, _iso_now()),
+            "UPDATE chat_settings SET moderation_action = ? WHERE chat_id = ?",
+            (action_norm, chat_id),
+        )
+
+    async def grant_chat_admin(self, chat_id: int, user_id: int, granted_by: int):
+        await self._backend.execute(
+            """
+            INSERT INTO chat_admin_access(chat_id, user_id, granted_by, created_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO NOTHING
+            """,
+            (chat_id, user_id, granted_by, _iso_now()),
+        )
+
+    async def revoke_chat_admin(self, chat_id: int, user_id: int):
+        await self._backend.execute(
+            "DELETE FROM chat_admin_access WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+
+    async def list_chat_admins(self, chat_id: int) -> list[int]:
+        rows = await self._backend.fetchall(
+            "SELECT user_id FROM chat_admin_access WHERE chat_id = ? ORDER BY created_at ASC",
+            (chat_id,),
+        )
+        return [int(r[0]) for r in rows]
+
+    async def has_chat_admin_access(self, chat_id: int, user_id: int) -> bool:
+        row = await self._backend.fetchone(
+            "SELECT 1 FROM chat_admin_access WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        return bool(row)
+
+    async def track_member(self, chat_id: int, user_id: int):
+        now_iso = _iso_now()
+        await self._backend.execute(
+            """
+            INSERT INTO tracked_members(chat_id, user_id, first_seen_at, last_seen_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+              last_seen_at = excluded.last_seen_at
+            """,
+            (chat_id, user_id, now_iso, now_iso),
+        )
+
+    async def get_tracked_members_for_scan(self, chat_id: int, limit_count: int) -> list[int]:
+        rows = await self._backend.fetchall(
+            """
+            SELECT user_id
+            FROM tracked_members
+            WHERE chat_id = ?
+            ORDER BY last_seen_at DESC
+            LIMIT ?
+            """,
+            (chat_id, limit_count),
+        )
+        return [int(r[0]) for r in rows]
+
+    async def set_member_check_result(
+        self,
+        chat_id: int,
+        user_id: int,
+        reason: str | None = None,
+        removed: bool = False,
+    ):
+        await self.track_member(chat_id, user_id)
+        removed_at = _iso_now() if removed else None
+        await self._backend.execute(
+            """
+            UPDATE tracked_members
+            SET last_checked_at = ?, last_reason = ?, removed_at = ?
+            WHERE chat_id = ? AND user_id = ?
+            """,
+            (_iso_now(), reason, removed_at, chat_id, user_id),
+        )
+
+    async def add_scan_job(self, chat_id: int, limit_count: int, priority: int = 0):
+        await self._backend.execute(
+            "INSERT INTO scan_jobs(chat_id, limit_count, priority, created_at) VALUES(?, ?, ?, ?)",
+            (chat_id, limit_count, priority, _iso_now()),
         )
 
     async def pending_jobs_count(self) -> int:
-        row = await self._backend.fetchone(
-            "SELECT COUNT(*) FROM scan_jobs WHERE status = 'pending'",
-        )
+        row = await self._backend.fetchone("SELECT COUNT(*) FROM scan_jobs WHERE status = 'pending'")
         return int(row[0]) if row else 0
 
     async def claim_pending_scan_jobs(self, limit: int = 20) -> list[tuple[int, int, int]]:
@@ -305,22 +477,31 @@ class Database:
             rows = await self._backend.fetchall(
                 """
                 WITH picked AS (
-                  SELECT id FROM scan_jobs
+                  SELECT id, priority
+                  FROM scan_jobs
                   WHERE status = 'pending'
-                  ORDER BY id
+                  ORDER BY priority DESC, id
                   LIMIT ?
                 )
                 UPDATE scan_jobs
                 SET status = 'processing'
                 WHERE id IN (SELECT id FROM picked)
-                RETURNING id, chat_id, limit_count
+                RETURNING id, chat_id, limit_count, priority
                 """,
                 (limit,),
             )
-            return [(int(r[0]), int(r[1]), int(r[2])) for r in rows]
+            normalized = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rows]
+            normalized.sort(key=lambda row: (-row[3], row[0]))
+            return [(row[0], row[1], row[2]) for row in normalized]
         except Exception:
             rows = await self._backend.fetchall(
-                "SELECT id, chat_id, limit_count FROM scan_jobs WHERE status = 'pending' ORDER BY id LIMIT ?",
+                """
+                SELECT id, chat_id, limit_count
+                FROM scan_jobs
+                WHERE status = 'pending'
+                ORDER BY priority DESC, id
+                LIMIT ?
+                """,
                 (limit,),
             )
             if not rows:
@@ -340,7 +521,40 @@ class Database:
                 (status, _iso_now(), job_id),
             )
             return
+        await self._backend.execute("UPDATE scan_jobs SET status = ? WHERE id = ?", (status, job_id))
+
+    async def list_chats_due_for_auto_enqueue(self, limit: int = 100) -> list[int]:
+        rows = await self._backend.fetchall(
+            """
+            SELECT mc.chat_id, mc.last_auto_enqueue_at, cs.check_interval_seconds
+            FROM managed_chats mc
+            JOIN chat_settings cs ON cs.chat_id = mc.chat_id
+            WHERE mc.enabled = 1
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        now = _utc_now()
+        due: list[int] = []
+        for chat_id_raw, last_auto, interval_raw in rows:
+            chat_id = int(chat_id_raw)
+            interval = int(interval_raw) if interval_raw is not None else 3600
+            if not last_auto:
+                due.append(chat_id)
+                continue
+            try:
+                last_dt = datetime.fromisoformat(str(last_auto))
+            except ValueError:
+                due.append(chat_id)
+                continue
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            if (now - last_dt).total_seconds() >= interval:
+                due.append(chat_id)
+        return due
+
+    async def touch_chat_auto_enqueue(self, chat_id: int):
         await self._backend.execute(
-            "UPDATE scan_jobs SET status = ? WHERE id = ?",
-            (status, job_id),
+            "UPDATE managed_chats SET last_auto_enqueue_at = ?, updated_at = ? WHERE chat_id = ?",
+            (_iso_now(), _iso_now(), chat_id),
         )
