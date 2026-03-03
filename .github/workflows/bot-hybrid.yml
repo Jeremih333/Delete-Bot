@@ -29,6 +29,7 @@ jobs:
 
       - name: Run worker
         env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
           DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
           DB_PATH: ${{ secrets.DB_PATH || 'bot.db' }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
