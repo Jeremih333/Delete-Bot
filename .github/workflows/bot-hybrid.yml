@@ -13,6 +13,13 @@ jobs:
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+      DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
+      DB_PATH: ${{ secrets.DB_PATH || 'bot.db' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,12 +35,6 @@ jobs:
           pip install -r requirements.txt
 
       - name: Env readiness
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
-          DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           python - <<'PY'
           import os
@@ -47,25 +48,20 @@ jobs:
           PY
 
       - name: D1 precheck
-        if: ${{ (secrets.DB_BACKEND || 'sqlite') == 'cloudflare_d1' }}
-        env:
-          DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
-          DB_PATH: ${{ secrets.DB_PATH || 'bot.db' }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        if: ${{ env.DB_BACKEND == 'cloudflare_d1' }}
         run: |
           python - <<'PY'
           import asyncio
+          import os
           from bot.db import Database
 
           async def main():
               db = Database(
-                  path="bot.db",
-                  backend="cloudflare_d1",
-                  cloudflare_account_id="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
-                  cloudflare_d1_database_id="${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}",
-                  cloudflare_api_token="${{ secrets.CLOUDFLARE_API_TOKEN }}",
+                  path=os.getenv("DB_PATH", "bot.db"),
+                  backend=os.getenv("DB_BACKEND", "sqlite"),
+                  cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""),
+                  cloudflare_d1_database_id=os.getenv("CLOUDFLARE_D1_DATABASE_ID", ""),
+                  cloudflare_api_token=os.getenv("CLOUDFLARE_API_TOKEN", ""),
               )
               await db.init()
               print("d1 precheck ok")
@@ -74,11 +70,4 @@ jobs:
           PY
 
       - name: Run worker
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
-          DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
-          DB_PATH: ${{ secrets.DB_PATH || 'bot.db' }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: python -m bot.worker_scan
