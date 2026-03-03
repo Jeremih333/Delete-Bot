@@ -80,7 +80,7 @@ def load_config() -> Config:
         tarif_message_6=os.getenv("TARIF_MESSAGE_6", "https://t.me/"),
         tarif_message_12=os.getenv("TARIF_MESSAGE_12", "https://t.me/"),
         hybrid_queue_threshold=_parse_int_env("HYBRID_QUEUE_THRESHOLD", 1000),
-        hybrid_scan_soft_timeout_ms=_parse_int_env("HYBRID_SCAN_SOFT_TIMEOUT_MS", 30000),
+        hybrid_scan_soft_timeout_ms=_parse_int_env("HYBRID_SCAN_SOFT_TIMEOUT_MS", 300000),
         db_backend=os.getenv("DB_BACKEND", "sqlite").strip().lower(),
         db_path=os.getenv("DB_PATH", "bot.db"),
         cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip(),

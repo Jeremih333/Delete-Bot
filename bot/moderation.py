@@ -19,6 +19,14 @@ DELETED_ERROR_PATTERNS = (
     "peer_id_invalid",
 )
 
+TRANSIENT_ERROR_PATTERNS = (
+    "too many requests",
+    "retry after",
+    "timeout",
+    "timed out",
+    "gateway",
+)
+
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
@@ -32,6 +40,16 @@ def classify_exception_as_reason(exc: Exception, delete_deleted_enabled: bool) -
         if pattern in text:
             return "deleted"
     return None
+
+
+def classify_exception_kind(exc: Exception) -> str:
+    text = _normalize_text(str(exc))
+    for pattern in TRANSIENT_ERROR_PATTERNS:
+        if pattern in text:
+            return "transient"
+    if classify_exception_as_reason(exc, True) == "deleted":
+        return "deactivated_hint"
+    return "permanent"
 
 
 def get_account_state(
@@ -62,6 +80,29 @@ def get_account_state(
         return "frozen", signals
 
     return None, signals
+
+
+def classify_member_or_error(
+    member_or_exc: ChatMember | Exception,
+    delete_deleted_enabled: bool,
+    delete_frozen_enabled: bool,
+) -> tuple[str | None, dict[str, bool]]:
+    if isinstance(member_or_exc, Exception):
+        reason = classify_exception_as_reason(member_or_exc, delete_deleted_enabled)
+        return (
+            reason,
+            {
+                "is_admin": False,
+                "is_bot": False,
+                "name_deleted": False,
+                "is_fake": False,
+                "is_scam": False,
+                "exception_pattern_hit": reason == "deleted",
+            },
+        )
+    reason, signals = get_account_state(member_or_exc, delete_deleted_enabled, delete_frozen_enabled)
+    signals["exception_pattern_hit"] = False
+    return reason, signals
 
 
 def classify_member(

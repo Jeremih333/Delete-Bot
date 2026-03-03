@@ -64,23 +64,46 @@ TABLE_STATEMENTS = [
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
       limit_count INTEGER NOT NULL,
+      window_key TEXT,
       priority INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TEXT NOT NULL,
       finished_at TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS scan_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER,
+      chat_id INTEGER NOT NULL,
+      source TEXT NOT NULL DEFAULT 'auto',
+      requested_limit INTEGER NOT NULL,
+      report_total INTEGER NOT NULL,
+      tracked_total INTEGER NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      processed INTEGER NOT NULL DEFAULT 0,
+      removed_deleted INTEGER NOT NULL DEFAULT 0,
+      removed_frozen INTEGER NOT NULL DEFAULT 0,
+      errors INTEGER NOT NULL DEFAULT 0,
+      timed_out INTEGER NOT NULL DEFAULT 0,
+      error_code TEXT
+    )
+    """,
 ]
 
 INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_scan_jobs_status_priority_id ON scan_jobs(status, priority, id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_jobs_chat_window_unique ON scan_jobs(chat_id, window_key)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_expires ON subscriptions(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_tracked_members_chat_last_seen ON tracked_members(chat_id, last_seen_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_managed_chats_owner ON managed_chats(owner_user_id, enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_scan_runs_chat_started ON scan_runs(chat_id, started_at DESC)",
 ]
 
 MIGRATION_STATEMENTS = [
     "ALTER TABLE scan_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE scan_jobs ADD COLUMN window_key TEXT",
     "ALTER TABLE chat_settings ADD COLUMN delete_deleted_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE chat_settings ADD COLUMN moderation_action TEXT NOT NULL DEFAULT 'ban'",
     "ALTER TABLE managed_chats ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'supergroup'",
@@ -569,6 +592,20 @@ class Database:
         )
         return int(row[0]) if row else 0
 
+    def get_scan_target(
+        self,
+        chat_id: int,
+        owner_is_premium: bool,
+        known_members: int,
+        chat_member_count: int,
+    ) -> int:
+        # chat_id is kept in signature intentionally for future per-chat targeting policies.
+        _ = chat_id
+        if known_members <= 0 or chat_member_count <= 0:
+            return 0
+        cap = chat_member_count if owner_is_premium else min(chat_member_count, 3500)
+        return max(0, min(cap, known_members))
+
     async def set_member_check_result(
         self,
         chat_id: int,
@@ -587,15 +624,54 @@ class Database:
             (_iso_now(), reason, removed_at, chat_id, user_id),
         )
 
-    async def add_scan_job(self, chat_id: int, limit_count: int, priority: int = 0):
+    async def add_scan_job(self, chat_id: int, limit_count: int, priority: int = 0, window_key: str | None = None):
         await self._backend.execute(
-            "INSERT INTO scan_jobs(chat_id, limit_count, priority, created_at) VALUES(?, ?, ?, ?)",
-            (chat_id, limit_count, priority, _iso_now()),
+            "INSERT INTO scan_jobs(chat_id, limit_count, window_key, priority, created_at) VALUES(?, ?, ?, ?, ?)",
+            (chat_id, limit_count, window_key, priority, _iso_now()),
         )
+
+    async def enqueue_scan_job_if_absent(
+        self,
+        chat_id: int,
+        window_key: str,
+        limit_count: int,
+        priority: int,
+    ) -> bool:
+        if limit_count <= 0:
+            return False
+        try:
+            await self._backend.execute(
+                """
+                INSERT INTO scan_jobs(chat_id, limit_count, window_key, priority, created_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, window_key) DO NOTHING
+                """,
+                (chat_id, limit_count, window_key, priority, _iso_now()),
+            )
+        except Exception:
+            return False
+        row = await self._backend.fetchone(
+            """
+            SELECT 1
+            FROM scan_jobs
+            WHERE chat_id = ? AND window_key = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id, window_key),
+        )
+        return bool(row)
 
     async def pending_jobs_count(self) -> int:
         row = await self._backend.fetchone("SELECT COUNT(*) FROM scan_jobs WHERE status = 'pending'")
         return int(row[0]) if row else 0
+
+    async def has_open_scan_job(self, chat_id: int) -> bool:
+        row = await self._backend.fetchone(
+            "SELECT 1 FROM scan_jobs WHERE chat_id = ? AND status IN ('pending', 'processing') LIMIT 1",
+            (chat_id,),
+        )
+        return bool(row)
 
     async def claim_pending_scan_jobs(self, limit: int = 20) -> list[tuple[int, int, int]]:
         try:
@@ -647,6 +723,77 @@ class Database:
             )
             return
         await self._backend.execute("UPDATE scan_jobs SET status = ? WHERE id = ?", (status, job_id))
+
+    async def start_scan_run(
+        self,
+        job_id: int,
+        chat_id: int,
+        source: str,
+        requested_limit: int,
+        report_total: int,
+        tracked_total: int,
+    ) -> int:
+        await self._backend.execute(
+            """
+            INSERT INTO scan_runs(job_id, chat_id, source, requested_limit, report_total, tracked_total, started_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (job_id, chat_id, source, requested_limit, report_total, tracked_total, _iso_now()),
+        )
+        row = await self._backend.fetchone("SELECT MAX(id) FROM scan_runs WHERE job_id = ? AND chat_id = ?", (job_id, chat_id))
+        return int(row[0]) if row and row[0] is not None else 0
+
+    async def finish_scan_run(
+        self,
+        run_id: int,
+        processed: int,
+        removed_deleted: int,
+        removed_frozen: int,
+        errors: int,
+        timed_out: bool,
+        error_code: str | None = None,
+    ):
+        await self._backend.execute(
+            """
+            UPDATE scan_runs
+            SET finished_at = ?,
+                processed = ?,
+                removed_deleted = ?,
+                removed_frozen = ?,
+                errors = ?,
+                timed_out = ?,
+                error_code = ?
+            WHERE id = ?
+            """,
+            (_iso_now(), processed, removed_deleted, removed_frozen, errors, 1 if timed_out else 0, error_code, run_id),
+        )
+
+    async def list_last_scan_runs(self, limit: int = 20) -> list[tuple[int, int, str, str, int, int, int, int, int, int]]:
+        rows = await self._backend.fetchall(
+            """
+            SELECT id, chat_id, source, started_at, processed, report_total, tracked_total,
+                   removed_deleted + removed_frozen AS removed_total, errors, timed_out
+            FROM scan_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [
+            (
+                int(r[0]),
+                int(r[1]),
+                str(r[2]),
+                str(r[3]),
+                int(r[4]),
+                int(r[5]),
+                int(r[6]),
+                int(r[7]),
+                int(r[8]),
+                int(r[9]),
+            )
+            for r in rows
+        ]
 
     async def list_chats_due_for_auto_enqueue(self, limit: int = 100) -> list[int]:
         rows = await self._backend.fetchall(

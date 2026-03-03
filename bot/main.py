@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import os
 
@@ -20,10 +21,19 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
+from bot.callbacks import parse_settings_interval
 from bot.config import load_config
 from bot.db import Database
 from bot.keyboards import dev_kb, premium_kb, start_kb
-from bot.moderation import classify_exception_as_reason, classify_member, reason_to_human, remove_member
+from bot.moderation import classify_member_or_error, reason_to_human, remove_member
+from bot.texts.ru import PREMIUM_REQUIRED_ALERT, STATUS_DIAGNOSTICS
+from bot.services.premium_guard import (
+    FEATURE_FROZEN_DELETE,
+    FEATURE_INTERVAL_FAST,
+    FEATURE_KICK_MODE,
+    can_use_feature,
+)
+from bot.services.scan_scheduler import enqueue_scan_if_absent
 
 
 class DevGrant(StatesGroup):
@@ -45,6 +55,8 @@ db = Database(
     cloudflare_api_token=cfg.cloudflare_api_token,
 )
 dp = Dispatcher(storage=MemoryStorage())
+logger = logging.getLogger("delete_bot.main")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
 def _md_escape(value: str) -> str:
@@ -76,8 +88,6 @@ def _plan_limits(is_premium: bool) -> tuple[int, int]:
 def _chat_kind(chat_type: str) -> str:
     return "канал" if chat_type == "channel" else "чат"
 
-
-PREMIUM_REQUIRED_ALERT = "🔒 Эта функция доступна только в Premium. Откройте /premium для оформления."
 
 
 def _readd_link(chat_type: str) -> str:
@@ -415,7 +425,21 @@ async def render_chat_settings_text(chat_id: int) -> str:
     return base_text
 
 
-async def auto_enqueue_loop():
+async def _compute_scan_limit(bot: Bot, db: Database, chat_id: int, premium: bool) -> int:
+    tracked_count = await db.count_tracked_members(chat_id)
+    try:
+        member_count = int(await bot.get_chat_member_count(chat_id))
+    except Exception:
+        member_count = tracked_count
+    return db.get_scan_target(
+        chat_id=chat_id,
+        owner_is_premium=premium,
+        known_members=tracked_count,
+        chat_member_count=member_count,
+    )
+
+
+async def auto_enqueue_loop(bot: Bot):
     while True:
         try:
             chat_ids = await db.list_chats_due_for_auto_enqueue(limit=150)
@@ -425,16 +449,28 @@ async def auto_enqueue_loop():
                     continue
                 owner_user_id = chat_data[3]
                 premium = await db.is_premium(owner_user_id)
-                await db.enforce_plan_limits(chat_id, premium)
-                if premium:
-                    limit_count = await db.count_tracked_members(chat_id)
-                else:
-                    limit_count = 3500
+                interval, _dd, _df, _action = await db.enforce_plan_limits(chat_id, premium)
+                limit_count = await _compute_scan_limit(bot, db, chat_id, premium)
                 if limit_count > 0:
-                    await db.add_scan_job(chat_id, limit_count, priority=1 if premium else 0)
+                    enqueued = await enqueue_scan_if_absent(
+                        db=db,
+                        chat_id=chat_id,
+                        interval_seconds=interval,
+                        limit_count=limit_count,
+                        priority=1 if premium else 0,
+                        source="auto",
+                    )
+                    logger.info(
+                        "event=auto_enqueue chat_id=%s owner_premium=%s limit_count=%s interval=%s enqueued=%s",
+                        chat_id,
+                        int(premium),
+                        limit_count,
+                        interval,
+                        int(enqueued),
+                    )
                 await db.touch_chat_auto_enqueue(chat_id)
         except Exception:
-            pass
+            logger.exception("event=auto_enqueue_loop_error")
         await asyncio.sleep(30)
 
 
@@ -664,7 +700,7 @@ async def cb_toggle_frozen(c: CallbackQuery):
         return
     await c.answer()
     premium = await db.is_premium(chat_data[3])
-    if not premium:
+    if not can_use_feature(premium, FEATURE_FROZEN_DELETE).allowed:
         await db.enforce_plan_limits(chat_id, False)
         await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
@@ -696,7 +732,7 @@ async def cb_toggle_action(c: CallbackQuery):
     premium = await db.is_premium(chat_data[3])
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     new_action = "kick" if moderation_action == "ban" else "ban"
-    if new_action == "kick" and not premium:
+    if new_action == "kick" and not can_use_feature(premium, FEATURE_KICK_MODE).allowed:
         await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
     await db.set_moderation_action(chat_id, new_action)
@@ -718,15 +754,18 @@ async def cb_toggle_action(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("settings:interval:"))
 async def cb_interval(c: CallbackQuery):
-    _, _, chat_raw, seconds_raw = c.data.split(":")
-    chat_id = int(chat_raw)
-    seconds = int(seconds_raw)
+    parsed = parse_settings_interval(c.data)
+    if not parsed:
+        await c.answer("Некорректные параметры интервала", show_alert=True)
+        return
+    chat_id = parsed.chat_id
+    seconds = parsed.seconds
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
     await c.answer()
     premium = await db.is_premium(chat_data[3])
-    if seconds in (3600, 60, 30) and not premium:
+    if seconds in (3600, 60, 30) and not can_use_feature(premium, FEATURE_INTERVAL_FAST).allowed:
         await db.enforce_plan_limits(chat_id, False)
         await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
@@ -873,6 +912,58 @@ async def cmd_dev(m: Message, state: FSMContext, command: CommandObject):
         await m.answer("\n".join(lines), parse_mode="Markdown")
         return
 
+
+    if args == "queue":
+        pending = await db.pending_jobs_count()
+        await m.answer(f"?? Pending jobs: *{pending}*", parse_mode="Markdown")
+        return
+
+    if args == "last_runs":
+        runs = await db.list_last_scan_runs(limit=10)
+        if not runs:
+            await m.answer("????????? ???????? ????? ???.")
+            return
+        lines = ["?? *????????? scan-runs*"]
+        for run_id, chat_id, source, started_at, processed, report_total, tracked_total, removed_total, err, timed_out in runs:
+            lines.append(
+                f"? id `{run_id}` chat `{chat_id}` src `{source}`\n"
+                f"  checked `{processed}/{report_total}` tracked `{tracked_total}` removed `{removed_total}` err `{err}` timeout `{timed_out}`\n"
+                f"  at `{started_at}`"
+            )
+        await m.answer("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if args.startswith("chat_health"):
+        parts = args_raw.split()
+        if len(parts) != 2:
+            await m.answer("??????: /dev chat_health <chat_id>")
+            return
+        try:
+            chat_id = int(parts[1])
+        except ValueError:
+            await m.answer("chat_id ?????? ???? ??????.")
+            return
+        chat_data = await db.get_managed_chat(chat_id)
+        tracked = await db.count_tracked_members(chat_id)
+        has_open = await db.has_open_scan_job(chat_id)
+        if not chat_data:
+            await m.answer(
+                f"??? `{chat_id}` ?? ?????? ? managed_chats.\ntracked=`{tracked}` open_job=`{int(has_open)}`",
+                parse_mode="Markdown",
+            )
+            return
+        interval, delete_deleted, delete_frozen, action = await db.get_chat_settings(chat_id)
+        await m.answer(
+            "?? *Chat health*\n"
+            f"chat_id: `{chat_id}`\n"
+            f"title: `{_md_escape(chat_data[1])}`\n"
+            f"type: `{chat_data[2]}` enabled: `{chat_data[4]}` owner: `{chat_data[3]}`\n"
+            f"settings: interval `{interval}` deleted `{delete_deleted}` frozen `{delete_frozen}` action `{action}`\n"
+            f"tracked: `{tracked}` open_job: `{int(has_open)}`",
+            parse_mode="Markdown",
+        )
+        return
+
     if args.startswith("revoke"):
         parts = args_raw.split()
         if len(parts) == 2:
@@ -966,9 +1057,9 @@ async def cmd_check(m: Message):
     _, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(m.chat.id, owner_premium)
     try:
         member = await m.bot.get_chat_member(m.chat.id, target_id)
-        reason = classify_member(member, bool(delete_deleted), bool(delete_frozen))
+        reason, _ = classify_member_or_error(member, bool(delete_deleted), bool(delete_frozen))
     except Exception as exc:
-        reason = classify_exception_as_reason(exc, bool(delete_deleted))
+        reason, _ = classify_member_or_error(exc, bool(delete_deleted), bool(delete_frozen))
     await db.track_member(m.chat.id, target_id)
     await db.set_member_check_result(m.chat.id, target_id, reason=reason, removed=False)
     if not reason:
@@ -1017,8 +1108,8 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                 try:
                     await update.bot.send_message(
                         owner_user_id,
-                        f"⚠️ Лимит каналов исчерпан: {active_channels}/{channel_limit}. "
-                        "Отключите лишние каналы или оформите Premium через /premium.",
+                        f"?? ????? ??????? ????????: {active_channels}/{channel_limit}. "
+                        "????????? ?????? ?????? ??? ???????? Premium ????? /premium.",
                     )
                 finally:
                     await update.bot.leave_chat(chat_id)
@@ -1027,14 +1118,45 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                 try:
                     await update.bot.send_message(
                         owner_user_id,
-                        f"⚠️ Лимит чатов исчерпан: {active_chats}/{chat_limit}. "
-                        "Отключите лишние чаты или оформите Premium через /premium.",
+                        f"?? ????? ????? ????????: {active_chats}/{chat_limit}. "
+                        "????????? ?????? ???? ??? ???????? Premium ????? /premium.",
                     )
                 finally:
                     await update.bot.leave_chat(chat_id)
                 return
 
         await db.upsert_managed_chat(chat_id, title, owner_user_id, chat_type)
+        if chat_type in {"group", "supergroup"}:
+            try:
+                admins = await update.bot.get_chat_administrators(chat_id)
+                for admin in admins:
+                    if admin.user.is_bot:
+                        continue
+                    await db.track_member(chat_id, admin.user.id)
+                    await db.grant_chat_admin(chat_id, admin.user.id, owner_user_id)
+                await db.track_member(chat_id, owner_user_id)
+                premium = await db.is_premium(owner_user_id)
+                limit_count = await _compute_scan_limit(update.bot, db, chat_id, premium)
+                if limit_count > 0:
+                    enqueued = await enqueue_scan_if_absent(
+                        db=db,
+                        chat_id=chat_id,
+                        interval_seconds=60,
+                        limit_count=limit_count,
+                        priority=1 if premium else 0,
+                        source="onboard",
+                    )
+                    logger.info(
+                        "event=onboard_enqueue chat_id=%s owner_id=%s owner_premium=%s limit_count=%s enqueued=%s",
+                        chat_id,
+                        owner_user_id,
+                        int(premium),
+                        limit_count,
+                        int(enqueued),
+                    )
+            except Exception:
+                logger.exception("event=onboard_prepare_error chat_id=%s", chat_id)
+
         try:
             await update.bot.send_message(
                 owner_user_id,
@@ -1077,7 +1199,7 @@ async def main():
     bot = Bot(cfg.bot_token)
     await register_commands(bot)
     runner = await start_health_server()
-    scheduler_task = asyncio.create_task(auto_enqueue_loop())
+    scheduler_task = asyncio.create_task(auto_enqueue_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
