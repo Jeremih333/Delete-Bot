@@ -70,6 +70,18 @@ async def process_job(bot: Bot, db: Database, job_id: int, chat_id: int, limit_c
         f"⚠️ Ошибок: *{errors}*\n\n"
         "_Это сообщение удалится через 30 секунд._"
     )
+    if (removed_deleted + removed_frozen) == 0:
+        summary = (
+            "✅ *Авто-проверка завершена*\n\n"
+            f"⚙️ Интервал: *{_interval_label(interval)}*\n"
+            f"🛡️ Режим удаления: *{'КИК' if moderation_action == 'kick' else 'БАН'}*\n"
+            f"🧩 Правила: удаленные *{'ON' if delete_deleted else 'OFF'}*, "
+            f"замороженные *{'ON' if delete_frozen else 'OFF'}*\n\n"
+            f"👥 Проверено: *{processed}*\n"
+            "✨ Ничего подозрительного не найдено.\n"
+            f"⚠️ Ошибок: *{errors}*\n\n"
+            "_Это сообщение удалится через 30 секунд._"
+        )
     delete_task = None
     try:
         chat = await bot.get_chat(chat_id)

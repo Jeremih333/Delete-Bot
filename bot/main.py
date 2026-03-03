@@ -490,12 +490,12 @@ async def cb_toggle_deleted(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    premium = await db.is_premium(c.from_user.id)
+    await c.answer()
+    premium = await db.is_premium(chat_data[3])
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     await db.set_delete_deleted(chat_id, not bool(delete_deleted))
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
-    await c.answer("Обновлено")
     await _safe_edit_text(
         c,
         text,
@@ -516,16 +516,16 @@ async def cb_toggle_frozen(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    premium = await db.is_premium(c.from_user.id)
+    await c.answer()
+    premium = await db.is_premium(chat_data[3])
     if not premium:
         await db.enforce_plan_limits(chat_id, False)
-        await c.answer(PREMIUM_REQUIRED_ALERT, show_alert=True)
+        await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     await db.set_frozen(chat_id, not bool(delete_frozen))
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
-    await c.answer("Обновлено")
     await _safe_edit_text(
         c,
         text,
@@ -546,16 +546,16 @@ async def cb_toggle_action(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    premium = await db.is_premium(c.from_user.id)
+    await c.answer()
+    premium = await db.is_premium(chat_data[3])
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     new_action = "kick" if moderation_action == "ban" else "ban"
     if new_action == "kick" and not premium:
-        await c.answer(PREMIUM_REQUIRED_ALERT, show_alert=True)
+        await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
     await db.set_moderation_action(chat_id, new_action)
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
-    await c.answer("Режим удаления обновлен")
     await _safe_edit_text(
         c,
         text,
@@ -578,15 +578,15 @@ async def cb_interval(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
-    premium = await db.is_premium(c.from_user.id)
+    await c.answer()
+    premium = await db.is_premium(chat_data[3])
     if seconds in (3600, 60, 30) and not premium:
         await db.enforce_plan_limits(chat_id, False)
-        await c.answer(PREMIUM_REQUIRED_ALERT, show_alert=True)
+        await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
     await db.set_interval(chat_id, seconds)
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
-    await c.answer("Интервал обновлен")
     await _safe_edit_text(
         c,
         text,
@@ -607,10 +607,11 @@ async def cb_sync_admins(c: CallbackQuery):
     chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
         return
+    await c.answer()
     try:
         admins = await c.bot.get_chat_administrators(chat_id)
     except Exception:
-        await c.answer("Не удалось получить список админов", show_alert=True)
+        await c.message.answer("Не удалось получить список админов.")
         return
 
     existing = set(await db.list_chat_admins(chat_id))
@@ -621,8 +622,7 @@ async def cb_sync_admins(c: CallbackQuery):
         if uid not in existing:
             await db.grant_chat_admin(chat_id, uid, c.from_user.id)
 
-    await c.answer("Админы синхронизированы")
-    premium = await db.is_premium(c.from_user.id)
+    premium = await db.is_premium(chat_data[3])
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     text = await render_chat_settings_text(chat_id)
     await _safe_edit_text(
