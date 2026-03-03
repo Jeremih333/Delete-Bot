@@ -2,7 +2,7 @@ name: bot-hybrid-worker
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/2 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -68,6 +68,9 @@ jobs:
 
           asyncio.run(main())
           PY
+
+      - name: Enqueue scan jobs
+        run: python -m bot.enqueue_scan_jobs
 
       - name: Run worker
         run: python -m bot.worker_scan
