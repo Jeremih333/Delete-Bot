@@ -233,6 +233,14 @@ async def _settings_page_payload(owner_user_id: int, page: int) -> tuple[str, In
     return text, b.as_markup()
 
 
+async def _safe_edit_text(c: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup | None = None):
+    try:
+        await c.message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception:
+        # If message is unchanged or cannot be edited, send a fresh message.
+        await c.message.answer(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+
 def _format_premium_text() -> str:
     return (
         "💎 <b>Premium для автоматической модерации</b>\n\n"
@@ -447,9 +455,9 @@ async def cmd_settings(m: Message):
 @dp.callback_query(F.data.startswith("settings:list:page:"))
 async def cb_settings_list_page(c: CallbackQuery):
     page = int(c.data.split(":")[-1])
-    text, kb = await _settings_page_payload(c.from_user.id, page)
-    await c.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
     await c.answer()
+    text, kb = await _settings_page_payload(c.from_user.id, page)
+    await _safe_edit_text(c, text, kb)
 
 
 @dp.callback_query(F.data.startswith("settings:chat:"))
@@ -461,10 +469,11 @@ async def cb_settings_chat(c: CallbackQuery):
     premium = await db.is_premium(c.from_user.id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     text = await render_chat_settings_text(chat_id)
-    await c.message.edit_text(
+    await c.answer()
+    await _safe_edit_text(
+        c,
         text,
-        parse_mode="Markdown",
-        reply_markup=_chat_settings_kb(
+        _chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
@@ -473,7 +482,6 @@ async def cb_settings_chat(c: CallbackQuery):
             interval,
         ),
     )
-    await c.answer()
 
 
 @dp.callback_query(F.data.startswith("settings:toggle_deleted:"))
@@ -487,10 +495,11 @@ async def cb_toggle_deleted(c: CallbackQuery):
     await db.set_delete_deleted(chat_id, not bool(delete_deleted))
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
-    await c.message.edit_text(
+    await c.answer("Обновлено")
+    await _safe_edit_text(
+        c,
         text,
-        parse_mode="Markdown",
-        reply_markup=_chat_settings_kb(
+        _chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
@@ -499,7 +508,6 @@ async def cb_toggle_deleted(c: CallbackQuery):
             interval,
         ),
     )
-    await c.answer("Обновлено")
 
 
 @dp.callback_query(F.data.startswith("settings:toggle_frozen:"))
@@ -517,10 +525,11 @@ async def cb_toggle_frozen(c: CallbackQuery):
     await db.set_frozen(chat_id, not bool(delete_frozen))
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
-    await c.message.edit_text(
+    await c.answer("Обновлено")
+    await _safe_edit_text(
+        c,
         text,
-        parse_mode="Markdown",
-        reply_markup=_chat_settings_kb(
+        _chat_settings_kb(
             chat_id,
             True,
             bool(delete_deleted),
@@ -529,7 +538,6 @@ async def cb_toggle_frozen(c: CallbackQuery):
             interval,
         ),
     )
-    await c.answer("Обновлено")
 
 
 @dp.callback_query(F.data.startswith("settings:toggle_action:"))
@@ -547,10 +555,11 @@ async def cb_toggle_action(c: CallbackQuery):
     await db.set_moderation_action(chat_id, new_action)
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
-    await c.message.edit_text(
+    await c.answer("Режим удаления обновлен")
+    await _safe_edit_text(
+        c,
         text,
-        parse_mode="Markdown",
-        reply_markup=_chat_settings_kb(
+        _chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
@@ -559,7 +568,6 @@ async def cb_toggle_action(c: CallbackQuery):
             interval,
         ),
     )
-    await c.answer("Режим удаления обновлен")
 
 
 @dp.callback_query(F.data.startswith("settings:interval:"))
@@ -578,10 +586,11 @@ async def cb_interval(c: CallbackQuery):
     await db.set_interval(chat_id, seconds)
     text = await render_chat_settings_text(chat_id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
-    await c.message.edit_text(
+    await c.answer("Интервал обновлен")
+    await _safe_edit_text(
+        c,
         text,
-        parse_mode="Markdown",
-        reply_markup=_chat_settings_kb(
+        _chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
@@ -590,7 +599,6 @@ async def cb_interval(c: CallbackQuery):
             interval,
         ),
     )
-    await c.answer("Интервал обновлен")
 
 
 @dp.callback_query(F.data.startswith("settings:sync_admins:"))
@@ -617,10 +625,10 @@ async def cb_sync_admins(c: CallbackQuery):
     premium = await db.is_premium(c.from_user.id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     text = await render_chat_settings_text(chat_id)
-    await c.message.edit_text(
+    await _safe_edit_text(
+        c,
         text,
-        parse_mode="Markdown",
-        reply_markup=_chat_settings_kb(
+        _chat_settings_kb(
             chat_id,
             premium,
             bool(delete_deleted),
