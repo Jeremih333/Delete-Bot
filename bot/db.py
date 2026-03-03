@@ -6,7 +6,7 @@ import aiohttp
 import aiosqlite
 
 
-SCHEMA_STATEMENTS = [
+TABLE_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS subscriptions (
       user_id INTEGER PRIMARY KEY,
@@ -69,6 +69,9 @@ SCHEMA_STATEMENTS = [
       finished_at TEXT
     )
     """,
+]
+
+INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_scan_jobs_status_priority_id ON scan_jobs(status, priority, id)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_expires ON subscriptions(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_tracked_members_chat_last_seen ON tracked_members(chat_id, last_seen_at DESC)",
@@ -100,13 +103,15 @@ class _SQLiteBackend:
 
     async def init(self):
         async with aiosqlite.connect(self.path) as db:
-            for statement in SCHEMA_STATEMENTS:
+            for statement in TABLE_STATEMENTS:
                 await db.execute(statement)
             for statement in MIGRATION_STATEMENTS:
                 try:
                     await db.execute(statement)
                 except aiosqlite.OperationalError:
                     pass
+            for statement in INDEX_STATEMENTS:
+                await db.execute(statement)
             await db.commit()
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
@@ -167,13 +172,15 @@ class _CloudflareD1Backend:
         return first
 
     async def init(self):
-        for statement in SCHEMA_STATEMENTS:
+        for statement in TABLE_STATEMENTS:
             await self._request(statement)
         for statement in MIGRATION_STATEMENTS:
             try:
                 await self._request(statement)
             except RuntimeError:
                 pass
+        for statement in INDEX_STATEMENTS:
+            await self._request(statement)
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
         rows = await self.fetchall(sql, params)
