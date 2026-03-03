@@ -17,6 +17,7 @@ class Config:
 
     hybrid_queue_threshold: int
     hybrid_scan_soft_timeout_ms: int
+    worker_chat_concurrency: int
 
     db_backend: str
     db_path: str
@@ -68,7 +69,6 @@ def _parse_dev_telegram_ids() -> tuple[int, ...]:
     return tuple(result)
 
 
-
 def load_config() -> Config:
     return Config(
         bot_token=os.getenv("BOT_TOKEN", ""),
@@ -81,6 +81,7 @@ def load_config() -> Config:
         tarif_message_12=os.getenv("TARIF_MESSAGE_12", "https://t.me/"),
         hybrid_queue_threshold=_parse_int_env("HYBRID_QUEUE_THRESHOLD", 1000),
         hybrid_scan_soft_timeout_ms=_parse_int_env("HYBRID_SCAN_SOFT_TIMEOUT_MS", 300000),
+        worker_chat_concurrency=max(1, _parse_int_env("WORKER_CHAT_CONCURRENCY", 16)),
         db_backend=os.getenv("DB_BACKEND", "sqlite").strip().lower(),
         db_path=os.getenv("DB_PATH", "bot.db"),
         cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip(),

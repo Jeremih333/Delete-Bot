@@ -31,20 +31,26 @@ from bot.texts.ru import PREMIUM_REQUIRED_ALERT, STATUS_DIAGNOSTICS
 try:
     from bot.services.premium_guard import (
         FEATURE_FROZEN_DELETE,
+        FEATURE_INACTIVE_DELETE,
         FEATURE_INTERVAL_FAST,
         FEATURE_KICK_MODE,
         can_use_feature,
     )
 except ModuleNotFoundError:
     FEATURE_FROZEN_DELETE = "frozen_delete"
+    FEATURE_INACTIVE_DELETE = "inactive_delete"
     FEATURE_INTERVAL_FAST = "interval_fast"
     FEATURE_KICK_MODE = "kick_mode"
 
-    async def can_use_feature(_db: Database, user_id: int, _chat_id: int, feature: str) -> tuple[bool, str]:
-        is_premium = await _db.has_active_premium(user_id)
-        if feature in (FEATURE_FROZEN_DELETE, FEATURE_INTERVAL_FAST, FEATURE_KICK_MODE) and not is_premium:
-            return False, "premium_required"
-        return True, "ok"
+    class _FeatureDecision:
+        def __init__(self, allowed: bool, reason_code: str | None = None):
+            self.allowed = allowed
+            self.reason_code = reason_code
+
+    def can_use_feature(owner_is_premium: bool, feature: str) -> _FeatureDecision:
+        if feature in (FEATURE_FROZEN_DELETE, FEATURE_INACTIVE_DELETE, FEATURE_INTERVAL_FAST, FEATURE_KICK_MODE) and not owner_is_premium:
+            return _FeatureDecision(False, "premium_required")
+        return _FeatureDecision(True, None)
 
 try:
     from bot.services.scan_scheduler import enqueue_scan_if_absent
@@ -199,6 +205,8 @@ def _chat_settings_kb(
     premium: bool,
     delete_deleted: bool,
     delete_frozen: bool,
+    delete_inactive: bool,
+    inactive_days: int,
     moderation_action: str,
     current_interval: int,
 ) -> InlineKeyboardMarkup:
@@ -211,6 +219,14 @@ def _chat_settings_kb(
     b.button(
         text=f"{lock}{'✅' if delete_frozen else '❌'} Удалять замороженные аккаунты",
         callback_data=f"settings:toggle_frozen:{chat_id}",
+    )
+    b.button(
+        text=f"{lock}{'✅' if delete_inactive else '❌'} Удалять давно неактивные ({inactive_days} дн.)",
+        callback_data=f"settings:toggle_inactive:{chat_id}",
+    )
+    b.button(
+        text=f"{lock}Срок неактивности: {inactive_days} дн.",
+        callback_data=f"settings:inactive_days:{chat_id}",
     )
     action_label = "КИК" if moderation_action == "kick" else "БАН"
     action_lock = "" if premium or moderation_action == "ban" else "🔒 "
@@ -431,7 +447,10 @@ async def render_chat_settings_text(chat_id: int) -> str:
         return "Чат не найден."
     _, title, chat_type, owner_user_id, enabled = chat_data
     owner_premium = await db.is_premium(owner_user_id)
-    interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, owner_premium)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+        chat_id,
+        owner_premium,
+    )
     admin_count = len(await db.list_chat_admins(chat_id))
     safe_title = _md_escape(title)
     base_text = (
@@ -440,6 +459,7 @@ async def render_chat_settings_text(chat_id: int) -> str:
         f"• Интервал авто-проверки: *{_interval_label(interval)}*\n"
         f"• Удалять удаленные аккаунты: *{'ВКЛ' if delete_deleted else 'ВЫКЛ'}*\n"
         f"• Удалять замороженные аккаунты: *{'ВКЛ' if delete_frozen else 'ВЫКЛ'}*\n"
+        f"• Удалять давно неактивные: *{'ВКЛ' if delete_inactive else 'ВЫКЛ'}* (порог: *{inactive_days} дн.*)\n"
         f"• Режим удаления: *{'КИК (с авто-разбаном)' if moderation_action == 'kick' else 'БАН'}*\n"
         f"• План владельца: *{'Премиум' if owner_premium else 'Бесплатный'}*\n"
         f"• Админов с доступом: *{admin_count}*"
@@ -476,7 +496,7 @@ async def auto_enqueue_loop(bot: Bot):
                     continue
                 owner_user_id = chat_data[3]
                 premium = await db.is_premium(owner_user_id)
-                interval, _dd, _df, _action = await db.enforce_plan_limits(chat_id, premium)
+                interval, _dd, _df, _di, _days, _action = await db.enforce_plan_limits(chat_id, premium)
                 limit_count = await _compute_scan_limit(bot, db, chat_id, premium)
                 if limit_count > 0:
                     enqueued = await enqueue_scan_if_absent(
@@ -537,7 +557,10 @@ async def cmd_start(m: Message, command: CommandObject):
             await m.answer("Доступ запрещен: этот чат доступен только владельцу и синхронизированным админам.")
             return
         premium = await db.is_premium(chat_data[3])
-        interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+        interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+            chat_id,
+            premium,
+        )
         await m.answer(
             await render_chat_settings_text(chat_id),
             parse_mode="Markdown",
@@ -546,6 +569,8 @@ async def cmd_start(m: Message, command: CommandObject):
                 premium,
                 bool(delete_deleted),
                 bool(delete_frozen),
+                bool(delete_inactive),
+                int(inactive_days),
                 moderation_action,
                 interval,
             ),
@@ -676,7 +701,10 @@ async def cb_settings_chat(c: CallbackQuery):
     if not chat_data:
         return
     premium = await db.is_premium(chat_data[3])
-    interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+        chat_id,
+        premium,
+    )
     text = await render_chat_settings_text(chat_id)
     await c.answer()
     await _safe_edit_text(
@@ -687,6 +715,8 @@ async def cb_settings_chat(c: CallbackQuery):
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
             moderation_action,
             interval,
         ),
@@ -701,10 +731,16 @@ async def cb_toggle_deleted(c: CallbackQuery):
         return
     await c.answer()
     premium = await db.is_premium(chat_data[3])
-    interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+        chat_id,
+        premium,
+    )
     await db.set_delete_deleted(chat_id, not bool(delete_deleted))
     text = await render_chat_settings_text(chat_id)
-    interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+        chat_id,
+        premium,
+    )
     await _safe_edit_text(
         c,
         text,
@@ -713,6 +749,8 @@ async def cb_toggle_deleted(c: CallbackQuery):
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
             moderation_action,
             interval,
         ),
@@ -731,10 +769,10 @@ async def cb_toggle_frozen(c: CallbackQuery):
         await db.enforce_plan_limits(chat_id, False)
         await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
-    interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.get_chat_settings(chat_id)
     await db.set_frozen(chat_id, not bool(delete_frozen))
     text = await render_chat_settings_text(chat_id)
-    interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.get_chat_settings(chat_id)
     await _safe_edit_text(
         c,
         text,
@@ -743,6 +781,8 @@ async def cb_toggle_frozen(c: CallbackQuery):
             True,
             bool(delete_deleted),
             bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
             moderation_action,
             interval,
         ),
@@ -757,14 +797,17 @@ async def cb_toggle_action(c: CallbackQuery):
         return
     await c.answer()
     premium = await db.is_premium(chat_data[3])
-    interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+        chat_id,
+        premium,
+    )
     new_action = "kick" if moderation_action == "ban" else "ban"
     if new_action == "kick" and not can_use_feature(premium, FEATURE_KICK_MODE).allowed:
         await c.message.answer(PREMIUM_REQUIRED_ALERT)
         return
     await db.set_moderation_action(chat_id, new_action)
     text = await render_chat_settings_text(chat_id)
-    interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.get_chat_settings(chat_id)
     await _safe_edit_text(
         c,
         text,
@@ -773,6 +816,78 @@ async def cb_toggle_action(c: CallbackQuery):
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
+            moderation_action,
+            interval,
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("settings:toggle_inactive:"))
+async def cb_toggle_inactive(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[-1])
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
+        return
+    await c.answer()
+    premium = await db.is_premium(chat_data[3])
+    if not can_use_feature(premium, FEATURE_INACTIVE_DELETE).allowed:
+        await db.enforce_plan_limits(chat_id, False)
+        await c.message.answer(PREMIUM_REQUIRED_ALERT)
+        return
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.get_chat_settings(chat_id)
+    await db.set_inactive_cleanup(chat_id, not bool(delete_inactive))
+    text = await render_chat_settings_text(chat_id)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.get_chat_settings(chat_id)
+    await _safe_edit_text(
+        c,
+        text,
+        _chat_settings_kb(
+            chat_id,
+            premium,
+            bool(delete_deleted),
+            bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
+            moderation_action,
+            interval,
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("settings:inactive_days:"))
+async def cb_inactive_days(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[-1])
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
+        return
+    await c.answer()
+    premium = await db.is_premium(chat_data[3])
+    if not can_use_feature(premium, FEATURE_INACTIVE_DELETE).allowed:
+        await db.enforce_plan_limits(chat_id, False)
+        await c.message.answer(PREMIUM_REQUIRED_ALERT)
+        return
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.get_chat_settings(chat_id)
+    options = [30, 90, 180, 365]
+    try:
+        idx = options.index(int(inactive_days))
+    except ValueError:
+        idx = 0
+    new_days = options[(idx + 1) % len(options)]
+    await db.set_inactive_days(chat_id, new_days)
+    text = await render_chat_settings_text(chat_id)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.get_chat_settings(chat_id)
+    await _safe_edit_text(
+        c,
+        text,
+        _chat_settings_kb(
+            chat_id,
+            premium,
+            bool(delete_deleted),
+            bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
             moderation_action,
             interval,
         ),
@@ -798,7 +913,10 @@ async def cb_interval(c: CallbackQuery):
         return
     await db.set_interval(chat_id, seconds)
     text = await render_chat_settings_text(chat_id)
-    interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+        chat_id,
+        premium,
+    )
     await _safe_edit_text(
         c,
         text,
@@ -807,6 +925,8 @@ async def cb_interval(c: CallbackQuery):
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
             moderation_action,
             interval,
         ),
@@ -835,7 +955,10 @@ async def cb_sync_admins(c: CallbackQuery):
             await db.grant_chat_admin(chat_id, uid, c.from_user.id)
 
     premium = await db.is_premium(chat_data[3])
-    interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
+    interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await db.enforce_plan_limits(
+        chat_id,
+        premium,
+    )
     text = await render_chat_settings_text(chat_id)
     await _safe_edit_text(
         c,
@@ -845,6 +968,8 @@ async def cb_sync_admins(c: CallbackQuery):
             premium,
             bool(delete_deleted),
             bool(delete_frozen),
+            bool(delete_inactive),
+            int(inactive_days),
             moderation_action,
             interval,
         ),
@@ -973,20 +1098,30 @@ async def cmd_dev(m: Message, state: FSMContext, command: CommandObject):
         chat_data = await db.get_managed_chat(chat_id)
         tracked = await db.count_tracked_members(chat_id)
         has_open = await db.has_open_scan_job(chat_id)
+        health = await db.get_chat_health(chat_id)
         if not chat_data:
             await m.answer(
                 f"??? `{chat_id}` ?? ?????? ? managed_chats.\ntracked=`{tracked}` open_job=`{int(has_open)}`",
                 parse_mode="Markdown",
             )
             return
-        interval, delete_deleted, delete_frozen, action = await db.get_chat_settings(chat_id)
+        interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, action = await db.get_chat_settings(chat_id)
+        health_line = "health: n/a"
+        if health:
+            last_event_at, last_external_sync_at, tracked_h, chat_total_h, coverage_ratio_h, cooldown_until = health
+            health_line = (
+                f"health: tracked `{tracked_h}` total `{chat_total_h}` "
+                f"coverage `{coverage_ratio_h:.3f}` sync `{last_external_sync_at}` "
+                f"last_event `{last_event_at}` cooldown `{cooldown_until}`"
+            )
         await m.answer(
             "?? *Chat health*\n"
             f"chat_id: `{chat_id}`\n"
             f"title: `{_md_escape(chat_data[1])}`\n"
             f"type: `{chat_data[2]}` enabled: `{chat_data[4]}` owner: `{chat_data[3]}`\n"
-            f"settings: interval `{interval}` deleted `{delete_deleted}` frozen `{delete_frozen}` action `{action}`\n"
-            f"tracked: `{tracked}` open_job: `{int(has_open)}`",
+            f"settings: interval `{interval}` deleted `{delete_deleted}` frozen `{delete_frozen}` inactive `{delete_inactive}` inactive_days `{inactive_days}` action `{action}`\n"
+            f"tracked: `{tracked}` open_job: `{int(has_open)}`\n"
+            f"{health_line}",
             parse_mode="Markdown",
         )
         return
@@ -1081,13 +1216,16 @@ async def cmd_check(m: Message):
     chat_data = await db.get_managed_chat(m.chat.id)
     owner_user_id = chat_data[3] if chat_data else m.from_user.id
     owner_premium = await db.is_premium(owner_user_id)
-    _, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(m.chat.id, owner_premium)
+    _, delete_deleted, delete_frozen, _delete_inactive, _inactive_days, moderation_action = await db.enforce_plan_limits(
+        m.chat.id,
+        owner_premium,
+    )
     try:
         member = await m.bot.get_chat_member(m.chat.id, target_id)
         reason, _ = classify_member_or_error(member, bool(delete_deleted), bool(delete_frozen))
     except Exception as exc:
         reason, _ = classify_member_or_error(exc, bool(delete_deleted), bool(delete_frozen))
-    await db.track_member(m.chat.id, target_id)
+    await db.track_recent_activity(m.chat.id, target_id)
     await db.set_member_check_result(m.chat.id, target_id, reason=reason, removed=False)
     if not reason:
         await m.answer("✅ Для этого аккаунта нет активных правил удаления.")
@@ -1100,15 +1238,31 @@ async def cmd_check(m: Message):
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def track_message_authors(m: Message):
     if m.from_user:
-        await db.track_member(m.chat.id, m.from_user.id)
+        await db.track_recent_activity(m.chat.id, m.from_user.id)
     if m.reply_to_message and m.reply_to_message.from_user:
-        await db.track_member(m.chat.id, m.reply_to_message.from_user.id)
+        await db.track_recent_activity(m.chat.id, m.reply_to_message.from_user.id)
+    if m.forward_from:
+        await db.track_recent_activity(m.chat.id, m.forward_from.id)
+    if m.new_chat_members:
+        for user in m.new_chat_members:
+            if user and not user.is_bot:
+                await db.track_recent_activity(m.chat.id, user.id)
+    if m.left_chat_member and not m.left_chat_member.is_bot:
+        await db.track_recent_activity(m.chat.id, m.left_chat_member.id)
+
+
+@dp.edited_message(F.chat.type.in_({"group", "supergroup"}))
+async def track_edited_message_authors(m: Message):
+    if m.from_user:
+        await db.track_recent_activity(m.chat.id, m.from_user.id)
+    if m.reply_to_message and m.reply_to_message.from_user:
+        await db.track_recent_activity(m.chat.id, m.reply_to_message.from_user.id)
 
 
 @dp.chat_member()
 async def on_chat_member(update: ChatMemberUpdated):
     if update.chat.type in {"group", "supergroup"}:
-        await db.track_member(update.chat.id, update.new_chat_member.user.id)
+        await db.track_recent_activity(update.chat.id, update.new_chat_member.user.id)
 
 
 @dp.my_chat_member()
@@ -1159,9 +1313,9 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                 for admin in admins:
                     if admin.user.is_bot:
                         continue
-                    await db.track_member(chat_id, admin.user.id)
+                    await db.track_recent_activity(chat_id, admin.user.id)
                     await db.grant_chat_admin(chat_id, admin.user.id, owner_user_id)
-                await db.track_member(chat_id, owner_user_id)
+                await db.track_recent_activity(chat_id, owner_user_id)
                 premium = await db.is_premium(owner_user_id)
                 limit_count = await _compute_scan_limit(update.bot, db, chat_id, premium)
                 if limit_count > 0:

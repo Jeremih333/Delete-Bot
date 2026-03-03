@@ -44,6 +44,8 @@ TABLE_STATEMENTS = [
       check_interval_seconds INTEGER NOT NULL DEFAULT 14400,
       delete_deleted_enabled INTEGER NOT NULL DEFAULT 1,
       delete_frozen_enabled INTEGER NOT NULL DEFAULT 0,
+      delete_inactive_enabled INTEGER NOT NULL DEFAULT 0,
+      inactive_days INTEGER NOT NULL DEFAULT 180,
       moderation_action TEXT NOT NULL DEFAULT 'ban'
     )
     """,
@@ -55,6 +57,12 @@ TABLE_STATEMENTS = [
       last_seen_at TEXT NOT NULL,
       last_checked_at TEXT,
       last_reason TEXT,
+      source TEXT NOT NULL DEFAULT 'bot_event',
+      confidence INTEGER NOT NULL DEFAULT 0,
+      risk_score INTEGER NOT NULL DEFAULT 0,
+      next_check_at TEXT,
+      last_error_code TEXT,
+      transient_errors INTEGER NOT NULL DEFAULT 0,
       removed_at TEXT,
       PRIMARY KEY (chat_id, user_id)
     )
@@ -80,14 +88,28 @@ TABLE_STATEMENTS = [
       requested_limit INTEGER NOT NULL,
       report_total INTEGER NOT NULL,
       tracked_total INTEGER NOT NULL,
+      chat_total INTEGER NOT NULL DEFAULT 0,
       started_at TEXT NOT NULL,
       finished_at TEXT,
       processed INTEGER NOT NULL DEFAULT 0,
       removed_deleted INTEGER NOT NULL DEFAULT 0,
       removed_frozen INTEGER NOT NULL DEFAULT 0,
+      rate_limited_count INTEGER NOT NULL DEFAULT 0,
       errors INTEGER NOT NULL DEFAULT 0,
       timed_out INTEGER NOT NULL DEFAULT 0,
       error_code TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS chat_health (
+      chat_id INTEGER PRIMARY KEY,
+      last_event_at TEXT,
+      last_external_sync_at TEXT,
+      tracked_total INTEGER NOT NULL DEFAULT 0,
+      chat_total INTEGER NOT NULL DEFAULT 0,
+      coverage_ratio REAL NOT NULL DEFAULT 0,
+      cooldown_until TEXT,
+      updated_at TEXT NOT NULL
     )
     """,
 ]
@@ -97,6 +119,7 @@ INDEX_STATEMENTS = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_jobs_chat_window_unique ON scan_jobs(chat_id, window_key)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_expires ON subscriptions(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_tracked_members_chat_last_seen ON tracked_members(chat_id, last_seen_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_tracked_members_pick ON tracked_members(chat_id, removed_at, next_check_at, risk_score DESC, last_checked_at ASC)",
     "CREATE INDEX IF NOT EXISTS idx_managed_chats_owner ON managed_chats(owner_user_id, enabled)",
     "CREATE INDEX IF NOT EXISTS idx_scan_runs_chat_started ON scan_runs(chat_id, started_at DESC)",
 ]
@@ -105,8 +128,19 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE scan_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE scan_jobs ADD COLUMN window_key TEXT",
     "ALTER TABLE chat_settings ADD COLUMN delete_deleted_enabled INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE chat_settings ADD COLUMN delete_inactive_enabled INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE chat_settings ADD COLUMN inactive_days INTEGER NOT NULL DEFAULT 180",
     "ALTER TABLE chat_settings ADD COLUMN moderation_action TEXT NOT NULL DEFAULT 'ban'",
     "ALTER TABLE managed_chats ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'supergroup'",
+    "ALTER TABLE tracked_members ADD COLUMN source TEXT NOT NULL DEFAULT 'bot_event'",
+    "ALTER TABLE tracked_members ADD COLUMN confidence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tracked_members ADD COLUMN risk_score INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tracked_members ADD COLUMN next_check_at TEXT",
+    "ALTER TABLE tracked_members ADD COLUMN last_error_code TEXT",
+    "ALTER TABLE tracked_members ADD COLUMN transient_errors INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE scan_runs ADD COLUMN chat_total INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE scan_runs ADD COLUMN rate_limited_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE chat_health ADD COLUMN last_external_sync_at TEXT",
 ]
 
 
@@ -449,23 +483,36 @@ class Database:
     async def ensure_chat_settings(self, chat_id: int):
         await self._backend.execute("INSERT OR IGNORE INTO chat_settings(chat_id) VALUES(?)", (chat_id,))
 
-    async def get_chat_settings(self, chat_id: int) -> tuple[int, int, int, str]:
+    async def get_chat_settings(self, chat_id: int) -> tuple[int, int, int, int, int, str]:
         await self.ensure_chat_settings(chat_id)
         row = await self._backend.fetchone(
             """
-            SELECT check_interval_seconds, delete_deleted_enabled, delete_frozen_enabled, moderation_action
+            SELECT check_interval_seconds, delete_deleted_enabled, delete_frozen_enabled,
+                   delete_inactive_enabled, inactive_days, moderation_action
             FROM chat_settings
             WHERE chat_id = ?
             """,
             (chat_id,),
         )
         if not row:
-            return (14400, 1, 0, "ban")
-        interval, delete_deleted, delete_frozen, action = row
+            return (14400, 1, 0, 0, 180, "ban")
+        interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, action = row
         action_norm = str(action or "ban").lower()
         if action_norm not in {"ban", "kick"}:
             action_norm = "ban"
-        return (int(interval), int(delete_deleted), int(delete_frozen), action_norm)
+        days_norm = int(inactive_days or 180)
+        if days_norm < 30:
+            days_norm = 30
+        if days_norm > 3650:
+            days_norm = 3650
+        return (
+            int(interval),
+            int(delete_deleted),
+            int(delete_frozen),
+            int(delete_inactive),
+            days_norm,
+            action_norm,
+        )
 
     async def delete_subscription(self, user_id: int):
         await self._backend.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
@@ -491,6 +538,21 @@ class Database:
             (1 if enabled else 0, chat_id),
         )
 
+    async def set_inactive_cleanup(self, chat_id: int, enabled: bool):
+        await self.ensure_chat_settings(chat_id)
+        await self._backend.execute(
+            "UPDATE chat_settings SET delete_inactive_enabled = ? WHERE chat_id = ?",
+            (1 if enabled else 0, chat_id),
+        )
+
+    async def set_inactive_days(self, chat_id: int, days: int):
+        await self.ensure_chat_settings(chat_id)
+        days_norm = max(30, min(3650, int(days)))
+        await self._backend.execute(
+            "UPDATE chat_settings SET inactive_days = ? WHERE chat_id = ?",
+            (days_norm, chat_id),
+        )
+
     async def set_moderation_action(self, chat_id: int, action: str):
         await self.ensure_chat_settings(chat_id)
         action_norm = action.lower().strip()
@@ -501,10 +563,10 @@ class Database:
             (action_norm, chat_id),
         )
 
-    async def enforce_plan_limits(self, chat_id: int, owner_is_premium: bool) -> tuple[int, int, int, str]:
-        interval, delete_deleted, delete_frozen, moderation_action = await self.get_chat_settings(chat_id)
+    async def enforce_plan_limits(self, chat_id: int, owner_is_premium: bool) -> tuple[int, int, int, int, int, str]:
+        interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action = await self.get_chat_settings(chat_id)
         if owner_is_premium:
-            return (interval, delete_deleted, delete_frozen, moderation_action)
+            return (interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action)
 
         changed = False
         if interval != 14400:
@@ -512,6 +574,12 @@ class Database:
             changed = True
         if delete_frozen != 0:
             delete_frozen = 0
+            changed = True
+        if delete_inactive != 0:
+            delete_inactive = 0
+            changed = True
+        if inactive_days != 180:
+            inactive_days = 180
             changed = True
         if moderation_action != "ban":
             moderation_action = "ban"
@@ -523,12 +591,14 @@ class Database:
                 UPDATE chat_settings
                 SET check_interval_seconds = ?,
                     delete_frozen_enabled = 0,
+                    delete_inactive_enabled = 0,
+                    inactive_days = 180,
                     moderation_action = 'ban'
                 WHERE chat_id = ?
                 """,
                 (interval, chat_id),
             )
-        return (interval, delete_deleted, delete_frozen, moderation_action)
+        return (interval, delete_deleted, delete_frozen, delete_inactive, inactive_days, moderation_action)
 
     async def grant_chat_admin(self, chat_id: int, user_id: int, granted_by: int):
         await self._backend.execute(
@@ -560,17 +630,22 @@ class Database:
         )
         return bool(row)
 
-    async def track_member(self, chat_id: int, user_id: int):
+    async def track_member(self, chat_id: int, user_id: int, source: str = "bot_event"):
         now_iso = _iso_now()
         await self._backend.execute(
             """
-            INSERT INTO tracked_members(chat_id, user_id, first_seen_at, last_seen_at)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO tracked_members(chat_id, user_id, first_seen_at, last_seen_at, source, next_check_at)
+            VALUES(?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id, user_id) DO UPDATE SET
-              last_seen_at = excluded.last_seen_at
+              last_seen_at = excluded.last_seen_at,
+              source = CASE WHEN tracked_members.source = 'external_sync' THEN tracked_members.source ELSE excluded.source END
             """,
-            (chat_id, user_id, now_iso, now_iso),
+            (chat_id, user_id, now_iso, now_iso, source, now_iso),
         )
+        await self.touch_chat_health(chat_id, last_event_at=now_iso)
+
+    async def track_recent_activity(self, chat_id: int, user_id: int, source: str = "bot_event"):
+        await self.track_member(chat_id, user_id, source=source)
 
     async def get_tracked_members_for_scan(self, chat_id: int, limit_count: int, offset: int = 0) -> list[int]:
         rows = await self._backend.fetchall(
@@ -585,12 +660,42 @@ class Database:
         )
         return [int(r[0]) for r in rows]
 
+    async def claim_scan_candidates(self, chat_id: int, limit_count: int) -> list[int]:
+        if limit_count <= 0:
+            return []
+        rows = await self._backend.fetchall(
+            """
+            SELECT user_id
+            FROM tracked_members
+            WHERE chat_id = ?
+              AND removed_at IS NULL
+              AND (next_check_at IS NULL OR next_check_at <= ?)
+            ORDER BY risk_score DESC, COALESCE(last_checked_at, '') ASC, last_seen_at DESC
+            LIMIT ?
+            """,
+            (chat_id, _iso_now(), limit_count),
+        )
+        return [int(r[0]) for r in rows]
+
     async def count_tracked_members(self, chat_id: int) -> int:
         row = await self._backend.fetchone(
             "SELECT COUNT(*) FROM tracked_members WHERE chat_id = ?",
             (chat_id,),
         )
         return int(row[0]) if row else 0
+
+    async def get_tracked_member_activity(self, chat_id: int, user_id: int) -> tuple[int, int] | None:
+        row = await self._backend.fetchone(
+            """
+            SELECT strftime('%s', 'now') - strftime('%s', last_seen_at), strftime('%s', last_seen_at)
+            FROM tracked_members
+            WHERE chat_id = ? AND user_id = ?
+            """,
+            (chat_id, user_id),
+        )
+        if not row or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), int(row[1])
 
     def get_scan_target(
         self,
@@ -612,16 +717,58 @@ class Database:
         user_id: int,
         reason: str | None = None,
         removed: bool = False,
+        error_kind: str | None = None,
+        error_code: str | None = None,
     ):
         await self.track_member(chat_id, user_id)
-        removed_at = _iso_now() if removed else None
+        now = _utc_now()
+        now_iso = now.isoformat()
+        removed_at = now_iso if removed else None
+
+        confidence = 0
+        risk_score = 0
+        next_check_at = (now + timedelta(hours=24)).isoformat()
+        transient_errors = 0
+        if reason == "deleted":
+            confidence = 100
+            risk_score = 100
+            next_check_at = (now + timedelta(hours=168)).isoformat()
+        elif reason == "frozen":
+            confidence = 85
+            risk_score = 90
+            next_check_at = (now + timedelta(hours=12)).isoformat()
+        elif error_kind == "transient":
+            confidence = 20
+            risk_score = 70
+            transient_errors = 1
+            next_check_at = (now + timedelta(minutes=10)).isoformat()
+
         await self._backend.execute(
             """
             UPDATE tracked_members
-            SET last_checked_at = ?, last_reason = ?, removed_at = ?
+            SET last_checked_at = ?,
+                last_reason = ?,
+                removed_at = ?,
+                confidence = ?,
+                risk_score = ?,
+                next_check_at = ?,
+                last_error_code = ?,
+                transient_errors = CASE WHEN ? > 0 THEN transient_errors + ? ELSE transient_errors END
             WHERE chat_id = ? AND user_id = ?
             """,
-            (_iso_now(), reason, removed_at, chat_id, user_id),
+            (
+                now_iso,
+                reason,
+                removed_at,
+                confidence,
+                risk_score,
+                next_check_at,
+                error_code,
+                transient_errors,
+                transient_errors,
+                chat_id,
+                user_id,
+            ),
         )
 
     async def add_scan_job(self, chat_id: int, limit_count: int, priority: int = 0, window_key: str | None = None):
@@ -732,13 +879,14 @@ class Database:
         requested_limit: int,
         report_total: int,
         tracked_total: int,
+        chat_total: int = 0,
     ) -> int:
         await self._backend.execute(
             """
-            INSERT INTO scan_runs(job_id, chat_id, source, requested_limit, report_total, tracked_total, started_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO scan_runs(job_id, chat_id, source, requested_limit, report_total, tracked_total, chat_total, started_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (job_id, chat_id, source, requested_limit, report_total, tracked_total, _iso_now()),
+            (job_id, chat_id, source, requested_limit, report_total, tracked_total, chat_total, _iso_now()),
         )
         row = await self._backend.fetchone("SELECT MAX(id) FROM scan_runs WHERE job_id = ? AND chat_id = ?", (job_id, chat_id))
         return int(row[0]) if row and row[0] is not None else 0
@@ -751,6 +899,7 @@ class Database:
         removed_frozen: int,
         errors: int,
         timed_out: bool,
+        rate_limited_count: int = 0,
         error_code: str | None = None,
     ):
         await self._backend.execute(
@@ -760,13 +909,104 @@ class Database:
                 processed = ?,
                 removed_deleted = ?,
                 removed_frozen = ?,
+                rate_limited_count = ?,
                 errors = ?,
                 timed_out = ?,
                 error_code = ?
             WHERE id = ?
             """,
-            (_iso_now(), processed, removed_deleted, removed_frozen, errors, 1 if timed_out else 0, error_code, run_id),
+            (
+                _iso_now(),
+                processed,
+                removed_deleted,
+                removed_frozen,
+                rate_limited_count,
+                errors,
+                1 if timed_out else 0,
+                error_code,
+                run_id,
+            ),
         )
+
+    async def touch_chat_health(
+        self,
+        chat_id: int,
+        *,
+        last_event_at: str | None = None,
+        last_external_sync_at: str | None = None,
+        tracked_total: int | None = None,
+        chat_total: int | None = None,
+        coverage_ratio: float | None = None,
+        cooldown_until: str | None = None,
+    ):
+        now_iso = _iso_now()
+        await self._backend.execute(
+            """
+            INSERT OR IGNORE INTO chat_health(chat_id, tracked_total, chat_total, coverage_ratio, updated_at)
+            VALUES(?, 0, 0, 0, ?)
+            """,
+            (chat_id, now_iso),
+        )
+        fields: list[str] = []
+        params: list[Any] = []
+        if last_event_at is not None:
+            fields.append("last_event_at = ?")
+            params.append(last_event_at)
+        if last_external_sync_at is not None:
+            fields.append("last_external_sync_at = ?")
+            params.append(last_external_sync_at)
+        if tracked_total is not None:
+            fields.append("tracked_total = ?")
+            params.append(tracked_total)
+        if chat_total is not None:
+            fields.append("chat_total = ?")
+            params.append(chat_total)
+        if coverage_ratio is not None:
+            fields.append("coverage_ratio = ?")
+            params.append(coverage_ratio)
+        if cooldown_until is not None:
+            fields.append("cooldown_until = ?")
+            params.append(cooldown_until)
+        fields.append("updated_at = ?")
+        params.append(now_iso)
+        params.append(chat_id)
+        await self._backend.execute(
+            f"UPDATE chat_health SET {', '.join(fields)} WHERE chat_id = ?",
+            tuple(params),
+        )
+
+    async def get_chat_health(self, chat_id: int) -> tuple[str | None, str | None, int, int, float, str | None] | None:
+        row = await self._backend.fetchone(
+            """
+            SELECT last_event_at, last_external_sync_at, tracked_total, chat_total, coverage_ratio, cooldown_until
+            FROM chat_health
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+        if not row:
+            return None
+        return (
+            str(row[0]) if row[0] else None,
+            str(row[1]) if row[1] else None,
+            int(row[2] or 0),
+            int(row[3] or 0),
+            float(row[4] or 0),
+            str(row[5]) if row[5] else None,
+        )
+
+    async def list_active_managed_chats(self, limit: int = 100) -> list[tuple[int, str]]:
+        rows = await self._backend.fetchall(
+            """
+            SELECT chat_id, chat_type
+            FROM managed_chats
+            WHERE enabled = 1
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [(int(r[0]), str(r[1])) for r in rows]
 
     async def list_last_scan_runs(self, limit: int = 20) -> list[tuple[int, int, str, str, int, int, int, int, int, int]]:
         rows = await self._backend.fetchall(
