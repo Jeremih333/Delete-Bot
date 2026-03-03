@@ -76,6 +76,48 @@ def _chat_kind(chat_type: str) -> str:
     return "канал" if chat_type == "channel" else "чат"
 
 
+PREMIUM_REQUIRED_ALERT = "🔒 Эта функция доступна только в Premium. Откройте /premium для оформления."
+
+
+def _readd_link(chat_type: str) -> str:
+    username = cfg.bot_username.strip().lstrip("@")
+    if not username:
+        return "https://t.me/"
+    perms = "change_info+post_messages+edit_messages+delete_messages+invite_users+restrict_members+pin_messages+manage_topics+promote_members+manage_video_chats+anonymous"
+    if chat_type == "channel":
+        return f"https://t.me/{username}?startchannel=true&admin={perms}"
+    return f"https://t.me/{username}?startgroup=true&admin={perms}"
+
+
+def _readd_kb(chat_type: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    label = "📣 Добавить обратно в канал" if chat_type == "channel" else "👥 Добавить обратно в чат"
+    b.button(text=label, url=_readd_link(chat_type))
+    return b.as_markup()
+
+
+async def _guard_owner_chat_access(c: CallbackQuery, chat_id: int) -> tuple[int, str, str, int, int] | None:
+    chat_data = await db.get_managed_chat(chat_id)
+    if not chat_data:
+        await c.answer("Чат не найден", show_alert=True)
+        return None
+    if c.from_user.id != chat_data[3]:
+        await c.answer("Доступ только владельцу чата", show_alert=True)
+        return None
+    if chat_data[4] == 0:
+        chat_title = _md_escape(chat_data[1])
+        chat_type = chat_data[2]
+        await c.answer("Бот удален из этого чата/канала", show_alert=True)
+        await c.message.answer(
+            f"⚠️ Бот сейчас не подключён к *{chat_title}*.\n"
+            "Чтобы продолжить настройку, добавьте бота обратно.",
+            parse_mode="Markdown",
+            reply_markup=_readd_kb(chat_type),
+        )
+        return None
+    return chat_data
+
+
 async def is_telegram_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
     member = await bot.get_chat_member(chat_id, user_id)
     return member.status in {"creator", "administrator"}
@@ -347,6 +389,9 @@ async def cmd_premium(m: Message):
 async def cmd_status(m: Message):
     target_user_id = m.from_user.id
     if m.chat.type != "private":
+        if not await is_telegram_admin(m.bot, m.chat.id, m.from_user.id):
+            await m.answer("⚙️ Настройки бота доступны только администраторам чата.")
+            return
         chat_data = await db.get_managed_chat(m.chat.id)
         if not chat_data:
             await m.answer("Чат не подключен к панели владельца.")
@@ -389,6 +434,9 @@ async def cmd_settings(m: Message):
     if m.chat.type == "private":
         await show_owner_chats(m, page=1)
         return
+    if not await is_telegram_admin(m.bot, m.chat.id, m.from_user.id):
+        await m.answer("⚙️ Настройки бота доступны только администраторам чата.")
+        return
     if not await has_management_access(m.bot, m.chat.id, m.from_user.id):
         await m.answer("⛔ Команда доступна только назначенным администраторам.")
         return
@@ -407,12 +455,8 @@ async def cb_settings_list_page(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("settings:chat:"))
 async def cb_settings_chat(c: CallbackQuery):
     chat_id = int(c.data.split(":")[-1])
-    chat_data = await db.get_managed_chat(chat_id)
+    chat_data = await _guard_owner_chat_access(c, chat_id)
     if not chat_data:
-        await c.answer("Чат не найден", show_alert=True)
-        return
-    if c.from_user.id != chat_data[3]:
-        await c.answer("Доступ только владельцу чата", show_alert=True)
         return
     premium = await db.is_premium(c.from_user.id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
@@ -435,9 +479,8 @@ async def cb_settings_chat(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("settings:toggle_deleted:"))
 async def cb_toggle_deleted(c: CallbackQuery):
     chat_id = int(c.data.split(":")[-1])
-    chat_data = await db.get_managed_chat(chat_id)
-    if not chat_data or c.from_user.id != chat_data[3]:
-        await c.answer("Недоступно", show_alert=True)
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
         return
     premium = await db.is_premium(c.from_user.id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
@@ -462,14 +505,13 @@ async def cb_toggle_deleted(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("settings:toggle_frozen:"))
 async def cb_toggle_frozen(c: CallbackQuery):
     chat_id = int(c.data.split(":")[-1])
-    chat_data = await db.get_managed_chat(chat_id)
-    if not chat_data or c.from_user.id != chat_data[3]:
-        await c.answer("Недоступно", show_alert=True)
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
         return
     premium = await db.is_premium(c.from_user.id)
     if not premium:
         await db.enforce_plan_limits(chat_id, False)
-        await c.answer("Доступно только в Premium", show_alert=True)
+        await c.answer(PREMIUM_REQUIRED_ALERT, show_alert=True)
         return
     interval, delete_deleted, delete_frozen, moderation_action = await db.get_chat_settings(chat_id)
     await db.set_frozen(chat_id, not bool(delete_frozen))
@@ -493,15 +535,14 @@ async def cb_toggle_frozen(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("settings:toggle_action:"))
 async def cb_toggle_action(c: CallbackQuery):
     chat_id = int(c.data.split(":")[-1])
-    chat_data = await db.get_managed_chat(chat_id)
-    if not chat_data or c.from_user.id != chat_data[3]:
-        await c.answer("Недоступно", show_alert=True)
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
         return
     premium = await db.is_premium(c.from_user.id)
     interval, delete_deleted, delete_frozen, moderation_action = await db.enforce_plan_limits(chat_id, premium)
     new_action = "kick" if moderation_action == "ban" else "ban"
     if new_action == "kick" and not premium:
-        await c.answer("🔒 Режим КИК доступен только в Premium. Откройте /premium", show_alert=True)
+        await c.answer(PREMIUM_REQUIRED_ALERT, show_alert=True)
         return
     await db.set_moderation_action(chat_id, new_action)
     text = await render_chat_settings_text(chat_id)
@@ -526,14 +567,13 @@ async def cb_interval(c: CallbackQuery):
     _, _, _, chat_raw, seconds_raw = c.data.split(":")
     chat_id = int(chat_raw)
     seconds = int(seconds_raw)
-    chat_data = await db.get_managed_chat(chat_id)
-    if not chat_data or c.from_user.id != chat_data[3]:
-        await c.answer("Недоступно", show_alert=True)
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
         return
     premium = await db.is_premium(c.from_user.id)
     if seconds in (3600, 60, 30) and not premium:
         await db.enforce_plan_limits(chat_id, False)
-        await c.answer("🔒 Интервалы 1ч/1м/30с доступны только в Premium", show_alert=True)
+        await c.answer(PREMIUM_REQUIRED_ALERT, show_alert=True)
         return
     await db.set_interval(chat_id, seconds)
     text = await render_chat_settings_text(chat_id)
@@ -556,9 +596,8 @@ async def cb_interval(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("settings:sync_admins:"))
 async def cb_sync_admins(c: CallbackQuery):
     chat_id = int(c.data.split(":")[-1])
-    chat_data = await db.get_managed_chat(chat_id)
-    if not chat_data or c.from_user.id != chat_data[3]:
-        await c.answer("Недоступно", show_alert=True)
+    chat_data = await _guard_owner_chat_access(c, chat_id)
+    if not chat_data:
         return
     try:
         admins = await c.bot.get_chat_administrators(chat_id)
@@ -690,6 +729,9 @@ async def cmd_check(m: Message):
     if m.chat.type == "private":
         await m.answer("Команда доступна только в группе.")
         return
+    if not await is_telegram_admin(m.bot, m.chat.id, m.from_user.id):
+        await m.answer("⚙️ Настройки бота доступны только администраторам чата.")
+        return
     if not await has_management_access(m.bot, m.chat.id, m.from_user.id):
         await m.answer("⛔ Команда доступна только назначенным администраторам.")
         return
@@ -753,7 +795,7 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                     await update.bot.send_message(
                         owner_user_id,
                         f"⚠️ Лимит каналов исчерпан: {active_channels}/{channel_limit}. "
-                        "Отключите лишние каналы или оформите Premium.",
+                        "Отключите лишние каналы или оформите Premium через /premium.",
                     )
                 finally:
                     await update.bot.leave_chat(chat_id)
@@ -763,7 +805,7 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                     await update.bot.send_message(
                         owner_user_id,
                         f"⚠️ Лимит чатов исчерпан: {active_chats}/{chat_limit}. "
-                        "Отключите лишние чаты или оформите Premium.",
+                        "Отключите лишние чаты или оформите Premium через /premium.",
                     )
                 finally:
                     await update.bot.leave_chat(chat_id)

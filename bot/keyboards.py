@@ -16,7 +16,10 @@ def start_kb(bot_username: str):
         url=group_url,
     )
     b.button(text="📣 Добавить в канал", url=channel_url)
-    b.button(text="⚙️ Открыть настройки", switch_inline_query_current_chat="/settings")
+    b.button(
+        text="⚙️ Открыть настройки",
+        url=f"https://t.me/{username}?start=settings" if username else "https://t.me/",
+    )
     b.adjust(1)
     return b.as_markup()
 
