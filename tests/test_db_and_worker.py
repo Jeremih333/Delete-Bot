@@ -162,6 +162,7 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
             processed,
             removed_deleted,
             removed_frozen,
+            removed_inactive,
             errors,
             rate_limited_count,
             delete_task,
@@ -177,7 +178,7 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
             soft_timeout_ms=2000,
         )
         self.assertEqual(processed, 1)
-        self.assertEqual(removed_deleted + removed_frozen, 1)
+        self.assertEqual(removed_deleted + removed_frozen + removed_inactive, 1)
         self.assertEqual(errors, 0)
         self.assertGreaterEqual(report_tracked_total, 1)
         self.assertGreaterEqual(report_chat_total, 1)
@@ -207,7 +208,7 @@ class TestDatabaseAndWorker(unittest.IsolatedAsyncioTestCase):
             limit_count=limit_count,
             soft_timeout_ms=1000,
         )
-        self.assertEqual(result[1] + result[2], 0)
+        self.assertEqual(result[1] + result[2] + result[3], 0)
         self.assertEqual(fake_bot.send_message.await_count, 0)
 
     async def test_run_worker_processes_queue(self):
