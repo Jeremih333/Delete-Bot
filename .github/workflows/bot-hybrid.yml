@@ -27,6 +27,52 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Env readiness
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+          DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          backend = os.getenv("DB_BACKEND", "sqlite")
+          assert os.getenv("BOT_TOKEN"), "BOT_TOKEN is missing"
+          if backend == "cloudflare_d1":
+              assert os.getenv("CLOUDFLARE_ACCOUNT_ID"), "CLOUDFLARE_ACCOUNT_ID is missing"
+              assert os.getenv("CLOUDFLARE_D1_DATABASE_ID"), "CLOUDFLARE_D1_DATABASE_ID is missing"
+              assert os.getenv("CLOUDFLARE_API_TOKEN"), "CLOUDFLARE_API_TOKEN is missing"
+          print(f"env ready; backend={backend}")
+          PY
+
+      - name: D1 precheck
+        if: ${{ (secrets.DB_BACKEND || 'sqlite') == 'cloudflare_d1' }}
+        env:
+          DB_BACKEND: ${{ secrets.DB_BACKEND || 'sqlite' }}
+          DB_PATH: ${{ secrets.DB_PATH || 'bot.db' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          python - <<'PY'
+          import asyncio
+          from bot.db import Database
+
+          async def main():
+              db = Database(
+                  path="bot.db",
+                  backend="cloudflare_d1",
+                  cloudflare_account_id="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
+                  cloudflare_d1_database_id="${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}",
+                  cloudflare_api_token="${{ secrets.CLOUDFLARE_API_TOKEN }}",
+              )
+              await db.init()
+              print("d1 precheck ok")
+
+          asyncio.run(main())
+          PY
+
       - name: Run worker
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
