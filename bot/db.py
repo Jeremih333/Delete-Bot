@@ -1039,7 +1039,7 @@ class Database:
             for r in rows
         ]
 
-    async def list_chats_due_for_auto_enqueue(self, limit: int = 100) -> list[int]:
+    async def list_chats_due_for_auto_enqueue(self, limit: int = 100, min_interval_seconds: int = 0) -> list[int]:
         rows = await self._backend.fetchall(
             """
             SELECT mc.chat_id, mc.last_auto_enqueue_at, cs.check_interval_seconds
@@ -1056,6 +1056,8 @@ class Database:
         for chat_id_raw, last_auto, interval_raw in rows:
             chat_id = int(chat_id_raw)
             interval = int(interval_raw) if interval_raw is not None else 3600
+            if min_interval_seconds > 0:
+                interval = max(interval, int(min_interval_seconds))
             if not last_auto:
                 due.append(chat_id)
                 continue

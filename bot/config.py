@@ -19,6 +19,10 @@ class Config:
     hybrid_scan_soft_timeout_ms: int
     worker_chat_concurrency: int
     auto_enqueue_in_web: bool
+    web_enqueue_tick_seconds: int
+    web_enqueue_max_chats_per_tick: int
+    web_enqueue_min_interval_seconds: int
+    web_enqueue_queue_ceiling: int
 
     db_backend: str
     db_path: str
@@ -89,7 +93,11 @@ def load_config() -> Config:
         hybrid_scan_soft_timeout_ms=_parse_int_env("HYBRID_SCAN_SOFT_TIMEOUT_MS", 300000),
         worker_chat_concurrency=max(1, _parse_int_env("WORKER_CHAT_CONCURRENCY", 16)),
         auto_enqueue_in_web=_parse_bool_env("AUTO_ENQUEUE_IN_WEB", False),
-        db_backend=os.getenv("DB_BACKEND", "sqlite").strip().lower(),
+        web_enqueue_tick_seconds=max(15, _parse_int_env("WEB_ENQUEUE_TICK_SECONDS", 60)),
+        web_enqueue_max_chats_per_tick=max(1, _parse_int_env("WEB_ENQUEUE_MAX_CHATS_PER_TICK", 20)),
+        web_enqueue_min_interval_seconds=max(30, _parse_int_env("WEB_ENQUEUE_MIN_INTERVAL_SECONDS", 300)),
+        web_enqueue_queue_ceiling=max(1, _parse_int_env("WEB_ENQUEUE_QUEUE_CEILING", 300)),
+        db_backend=os.getenv("DB_BACKEND", "cloudflare_d1").strip().lower(),
         db_path=os.getenv("DB_PATH", "bot.db"),
         cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip(),
         cloudflare_d1_database_id=os.getenv("CLOUDFLARE_D1_DATABASE_ID", "").strip(),

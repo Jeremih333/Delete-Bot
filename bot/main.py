@@ -540,7 +540,19 @@ async def _maybe_sync_chat_admins(bot: Bot, chat_id: int, owner_user_id: int) ->
 async def auto_enqueue_loop(bot: Bot):
     while True:
         try:
-            chat_ids = await db.list_chats_due_for_auto_enqueue(limit=150)
+            pending_jobs = await db.pending_jobs_count()
+            if pending_jobs >= cfg.web_enqueue_queue_ceiling:
+                logger.info(
+                    "event=auto_enqueue_throttled reason=queue_ceiling pending=%s ceiling=%s",
+                    pending_jobs,
+                    cfg.web_enqueue_queue_ceiling,
+                )
+                await asyncio.sleep(cfg.web_enqueue_tick_seconds)
+                continue
+            chat_ids = await db.list_chats_due_for_auto_enqueue(
+                limit=cfg.web_enqueue_max_chats_per_tick,
+                min_interval_seconds=cfg.web_enqueue_min_interval_seconds,
+            )
             for chat_id in chat_ids:
                 chat_data = await db.get_managed_chat(chat_id)
                 if not chat_data or chat_data[4] == 0:
@@ -549,28 +561,30 @@ async def auto_enqueue_loop(bot: Bot):
                 await _maybe_sync_chat_admins(bot, chat_id, owner_user_id)
                 premium = await db.is_premium(owner_user_id)
                 interval, _dd, _df, _di, _days, _action = await db.enforce_plan_limits(chat_id, premium)
+                interval_for_window = max(interval, cfg.web_enqueue_min_interval_seconds)
                 limit_count = await _compute_scan_limit(bot, db, chat_id, premium)
                 if limit_count > 0:
                     enqueued = await enqueue_scan_if_absent(
                         db=db,
                         chat_id=chat_id,
-                        interval_seconds=interval,
+                        interval_seconds=interval_for_window,
                         limit_count=limit_count,
                         priority=1 if premium else 0,
                         source="auto",
                     )
                     logger.info(
-                        "event=auto_enqueue chat_id=%s owner_premium=%s limit_count=%s interval=%s enqueued=%s",
+                        "event=auto_enqueue chat_id=%s owner_premium=%s limit_count=%s interval=%s render_window=%s enqueued=%s",
                         chat_id,
                         int(premium),
                         limit_count,
                         interval,
+                        interval_for_window,
                         int(enqueued),
                     )
                 await db.touch_chat_auto_enqueue(chat_id)
         except Exception:
             logger.exception("event=auto_enqueue_loop_error")
-        await asyncio.sleep(30)
+        await asyncio.sleep(cfg.web_enqueue_tick_seconds)
 
 
 @dp.message(Command("start"))
